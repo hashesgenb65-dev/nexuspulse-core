@@ -1,6 +1,6 @@
 /**
  * @file tests/api/test_router.ts
- * @description Vitest suite for /src/api/router.ts.
+ * @description Vitest suite for /src/api/http_router.ts.
  *
  * Each test starts a real node:http server on 127.0.0.1 with an ephemeral port
  * and talks to it with node:http directly, so arbitrary methods and raw request

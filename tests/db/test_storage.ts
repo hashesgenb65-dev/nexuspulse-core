@@ -1,6 +1,6 @@
 /**
  * @file tests/db/test_storage.ts
- * @description Vitest suite for /src/db/storage.ts.
+ * @description Vitest suite for /src/db/record_store.ts.
  *
  * Every test runs against real files in a fresh temporary directory. Crash
  * damage is simulated by editing the bytes on disk, and record checksums are
