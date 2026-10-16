@@ -1,0 +1,60 @@
+# Mesh node runner and key-value API
+
+One mesh member runs from a JSON config file and serves two things: peer RPCs for consensus, and an HTTP key-value API for clients.
+
+## Config
+
+```json
+{
+  "nodeId": "node-1",
+  "rpc":  { "host": "10.0.0.1", "port": 7001 },
+  "http": { "host": "10.0.0.1", "port": 8001 },
+  "peers": [
+    { "id": "node-2", "host": "10.0.0.2", "rpcPort": 7001, "httpPort": 8001 },
+    { "id": "node-3", "host": "10.0.0.3", "rpcPort": 7001, "httpPort": 8001 }
+  ],
+  "electionTimeoutMs": 1000,
+  "heartbeatIntervalMs": 100,
+  "requestTimeoutMs": 500
+}
+```
+
+- `nodeId`: 1 to 63 lowercase letters, digits or hyphens. Unique in the cluster.
+- `rpc`, `http`: where this node listens. A port of `0` picks a free port.
+- `peers`: every other member, with its RPC and HTTP ports. At most 32. Peer ports must be real ports.
+- Timing fields are optional. Each must be an integer from 1 to 60000. `heartbeatIntervalMs` must be shorter than `electionTimeoutMs`.
+- Every problem in the file is reported together, with the field path.
+
+## Running
+
+`src/mesh/cli.ts` is the entry point. Compile it or run it with your existing TypeScript runner, then:
+
+```
+node-runner node-1.json
+```
+
+It exits with 2 for a bad config and 1 if it cannot bind its ports. On SIGINT or SIGTERM it stops cleanly and exits with 0.
+
+## HTTP API
+
+| Method | Path | Behaviour |
+|---|---|---|
+| GET | `/v1/kv/:key` | Reads the value this node has applied. Returns `appliedIndex`. A follower may lag the leader by a few entries. |
+| PUT | `/v1/kv/:key` | Body `{"value": <any JSON>}`. Replicated SET. |
+| DELETE | `/v1/kv/:key` | Replicated DELETE. Deleting a missing key succeeds. |
+
+Keys are 1 to 256 characters after URL decoding. Bodies are limited to 64 KiB.
+
+Writes go through the leader:
+
+- A follower answers **307** with the leader's address in `location`. Repeat the same request there.
+- A write answers **200** only after it commits and applies on the node that received it.
+- **409**: a later leader replaced the write before it committed. It was not applied. Retry.
+- **504**: the write did not commit within 2 seconds. The outcome is unknown.
+- **503**: no leader is known yet. Retry after the `retry-after` delay.
+
+## Not included
+
+- **No authentication** on the HTTP API or the peer RPCs. Bind both to a trusted network only.
+- **No log compaction or snapshots.** The log grows with every write.
+- **Reads are not linearizable.** A GET on a follower can return an older value.
