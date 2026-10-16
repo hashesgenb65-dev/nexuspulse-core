@@ -12,7 +12,7 @@ TypeScript. This directory holds the design and operating documents.
 
 - **Node.js 22.12 or later.** The plugin sandbox relies on the `--permission`
   flag and `process.getBuiltinModule`. The test suite has been verified on
-  Node 22.22 only.
+  Node 22.22 and Node 24.16.
 - npm, with the committed `package-lock.json`.
 
 ## Commands
@@ -48,7 +48,7 @@ start if the file is readable by group or others.
 | Module | Source | Tests | Notes |
 |---|---|---|---|
 | Stream engine | `src/core/engine.ts` | `tests/test_engine.ts` | Self-contained |
-| Alert rules | `src/core/rules.ts` | `tests/core/test_rules.ts` | Evaluated for TCP events only |
+| Alert rules | `src/core/rules.ts` | `tests/core/test_rules.ts` | Evaluated for TCP and HTTP events; cooldown per rule and source |
 | Envelope vault | `src/encryption/vault.ts` | `tests/encryption/` | PBKDF2 only; no Argon2 |
 | Framed transport | `src/grpc/transport.ts` | `tests/grpc/` | Custom protocol, not gRPC; no TLS; no real-socket test |
 | Plugin sandbox | `src/plugins/sandbox.ts` | `tests/plugins/` | Child processes; network not restricted |
@@ -63,12 +63,12 @@ start if the file is readable by group or others.
 | API auth | `src/api/auth.ts` | `tests/api/test_auth.ts` | Bearer tokens, two roles; no token rotation |
 | Config manager | `src/config/manager.ts` | `tests/config/test_config.ts` | |
 | TCP ingest | `src/ingest/tcp_ingest.ts` | `tests/ingest/test_tcp_ingest.ts` | No authentication; no TLS |
-| App layer | `src/app/` | `tests/app/` | Settings, server lifecycle, token file |
+| App layer | `src/app/` | `tests/app/` | Settings, server lifecycle, token file, rule evaluation over HTTP |
 | Token CLI | `src/cli/` | `tests/cli/test_token_cli.ts` | Entry point: `npm run token` |
 | Alert notifier | `src/alerts/notifier.ts` | `tests/alerts/test_notifier.ts` | In-process queue; at-most-once delivery |
 | Metrics export | `src/observability/prometheus.ts` | `tests/observability/test_prometheus.ts` | Prometheus text format; served at `/metrics` |
 | Worker queue | `src/queue/worker.ts` | `tests/test_worker.ts` | Dispatch on a microtask so bursts are priority-sorted |
 
 **Not yet built:** deployment guide; TLS and authentication for the TCP ingest
-port; Argon2; rule evaluation for events submitted over HTTP; a
-`RouterEngine` or `TimeSeriesStorageEngine` (design not yet agreed).
+port; Argon2; a `RouterEngine` or `TimeSeriesStorageEngine` (design not yet
+agreed).
