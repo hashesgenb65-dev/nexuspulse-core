@@ -52,6 +52,12 @@ export interface DriverOptions {
   random?: () => number;
   /** Receives failures from the transport or the node. `where` says which call failed. */
   onError?: (error: unknown, where: string) => void;
+  /**
+   * Called after an RPC or reply moves commitIndex, so the host can apply the newly committed
+   * entries. A leader in a one-node cluster commits in proposeCommand, which the host must follow
+   * with its own apply step.
+   */
+  onCommitAdvance?: () => void;
 }
 
 function assertPositiveInteger(name: string, value: number): void {
@@ -68,6 +74,7 @@ export class ConsensusDriver {
   private readonly heartbeatIntervalMs: number;
   private readonly random: () => number;
   private readonly onError: ((error: unknown, where: string) => void) | undefined;
+  private readonly onCommitAdvance: (() => void) | undefined;
   private readonly peers: readonly string[];
 
   private started = false;
@@ -92,6 +99,7 @@ export class ConsensusDriver {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs;
     this.random = options.random ?? Math.random;
     this.onError = options.onError;
+    this.onCommitAdvance = options.onCommitAdvance;
     this.peers = options.node.peerIds;
   }
 
@@ -125,11 +133,13 @@ export class ConsensusDriver {
 
   /** Handles an AppendEntries from the leader and returns the reply. */
   handleAppendRequest(request: AppendRequest): AppendReply {
+    const before = this.node.commitIndex;
     const reply = this.node.appendEntries(request.term, request.leaderId, request.entries, {
       prevLogIndex: request.prevLogIndex,
       prevLogTerm: request.prevLogTerm,
       leaderCommit: request.leaderCommit,
     });
+    if (this.node.commitIndex !== before) this.onCommitAdvance?.();
     this.syncRole();
     // A reply in the leader's own term means the leader is current, even if the entries were rejected.
     if (reply.term === request.term) this.resetElectionTimer();
@@ -229,7 +239,9 @@ export class ConsensusDriver {
     try {
       const reply = await this.transport.appendEntries(peer, request);
       if (!this.started) return;
+      const before = this.node.commitIndex;
       this.node.handleAppendReply(peer, request, reply);
+      if (this.node.commitIndex !== before) this.onCommitAdvance?.();
       this.syncRole();
     } catch (error) {
       this.report(error, `appendEntries ${peer}`);

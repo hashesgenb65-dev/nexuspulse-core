@@ -331,6 +331,8 @@ export class RaftConsensusNode {
     const index = lastEntry !== undefined ? lastEntry.index + 1 : 1;
     const entry: LogEntry = { index, term: this.currentTerm, command, payload };
     this.log.push(entry);
+    // Commit moves on replies from peers. A one-node cluster has no replies, so check here too.
+    this.advanceCommitIndex();
     return entry;
   }
 
