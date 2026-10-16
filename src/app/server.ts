@@ -16,8 +16,8 @@
  * The `/v1/*` routes require a token when a token file is configured.
  *
  * Rules. Rules are stored through the HTTP API and take effect after
- * {@link NexusPulseApp.reloadRules} runs. Rules are evaluated only for events
- * that the engine accepts over TCP. HTTP-submitted events are not yet checked.
+ * {@link NexusPulseApp.reloadRules} runs. Rules are evaluated for every event
+ * the engine accepts, whether it arrived over TCP or over the HTTP API.
  *
  * Alerts. Anomalies and rule findings go to an {@link AlertNotifier}. Its sinks
  * are the log and, if configured, a webhook. Repeats within the dedup window are
@@ -225,6 +225,7 @@ export class NexusPulseApp {
         rules: this.store,
         maxBatch: s.maxBatch,
         maxBodyBytes: s.maxBodyBytes,
+        submit: (raw: unknown) => this.submitAccepted(raw),
         onError: (err, info) =>
           this.logger.error('HTTP handler failed', {
             requestId: info.requestId,
@@ -247,7 +248,7 @@ export class NexusPulseApp {
         engine: this.engine,
         maxConnections: s.maxConnections,
         idleTimeoutMs: s.idleTimeoutMs,
-        submit: (raw: unknown) => this.submitTcp(raw),
+        submit: (raw: unknown) => this.submitAccepted(raw),
       });
       const tcpPort = await this.ingest.listen(s.tcpPort, s.tcpHost);
 
@@ -380,8 +381,12 @@ export class NexusPulseApp {
     return drained;
   }
 
-  /** Engine submit plus rule evaluation for events accepted over TCP. */
-  private submitTcp(raw: unknown): SubmitResult {
+  /**
+   * Engine submit plus rule evaluation. Shared by the TCP ingest and the HTTP
+   * API so that a rule sees every accepted event, whichever way it arrived.
+   * Rejected events are not evaluated.
+   */
+  private submitAccepted(raw: unknown): SubmitResult {
     const result = this.engine.submit(raw);
     if (result.accepted) this.evaluateRules(raw);
     return result;
