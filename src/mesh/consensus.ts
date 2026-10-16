@@ -108,6 +108,11 @@ export class RaftConsensusNode {
     return Math.floor((this.peers.length + 1) / 2) + 1;
   }
 
+  /** The ids of this node's peers, excluding itself. */
+  public get peerIds(): readonly string[] {
+    return this.peers;
+  }
+
   public start(): void {
     if (this.isRunning) return;
     this.isRunning = true;
