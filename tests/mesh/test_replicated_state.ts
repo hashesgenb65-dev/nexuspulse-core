@@ -120,12 +120,13 @@ describe('replicated key-value store over real sockets', () => {
     leader.node.proposeCommand('DELETE', { key: 'a' });
     leader.node.proposeCommand('NOOP', { key: 'x' });
 
-    await waitFor(() => [...members.values()].every((m) => m.store.lastApplied === 4));
+    // Index 1 is the barrier from the leader's election, so the four commands are indexes 2 to 5.
+    await waitFor(() => [...members.values()].every((m) => m.store.lastApplied === 5));
 
     const expected = JSON.stringify({ b: { list: [1, 'two'] } });
     for (const member of members.values()) {
       expect(JSON.stringify(member.store.snapshot())).toBe(expected);
-      expect(member.store.rejected.map((r) => r.index)).toEqual([4]);
+      expect(member.store.rejected.map((r) => r.index)).toEqual([5]);
     }
   });
 
@@ -134,7 +135,7 @@ describe('replicated key-value store over real sockets', () => {
     const first = await leaderOf(members);
 
     first.node.proposeCommand('SET', { key: 'before', value: 'old leader' });
-    await waitFor(() => [...members.values()].every((m) => m.store.lastApplied === 1));
+    await waitFor(() => [...members.values()].every((m) => m.store.lastApplied === 2));
 
     // Stop the leader and its server, so the survivors must elect a new one.
     first.driver.stop();
@@ -145,7 +146,8 @@ describe('replicated key-value store over real sockets', () => {
     const second = await leaderOf(survivors);
     second.node.proposeCommand('SET', { key: 'after', value: 'new leader' });
 
-    await waitFor(() => [...survivors.values()].every((m) => m.store.lastApplied === 2));
+    // Index 3 is the new leader's barrier, so the write after the failover is index 4.
+    await waitFor(() => [...survivors.values()].every((m) => m.store.lastApplied === 4));
     const expected = JSON.stringify({ after: 'new leader', before: 'old leader' });
     for (const member of survivors.values()) {
       expect(JSON.stringify(member.store.snapshot())).toBe(expected);

@@ -52,6 +52,8 @@ export interface MeshNodeConfig {
   readonly electionTimeoutMs: number;
   readonly heartbeatIntervalMs: number;
   readonly requestTimeoutMs: number;
+  /** Directory for the durable state file. Without it the node keeps nothing across restarts. */
+  readonly dataDir?: string;
 }
 
 export interface ConfigIssue {
@@ -177,12 +179,27 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     report,
   );
   const requestTimeoutMs = parseTiming(raw.requestTimeoutMs, 'requestTimeoutMs', DEFAULT_TIMING.requestTimeoutMs, report);
+  let dataDir: string | undefined;
+  if (raw.dataDir !== undefined) {
+    if (typeof raw.dataDir === 'string' && raw.dataDir.length > 0) dataDir = raw.dataDir;
+    else report('dataDir', 'must be a non-empty string');
+  }
+
   if (heartbeatIntervalMs >= electionTimeoutMs) {
     report('heartbeatIntervalMs', 'must be shorter than electionTimeoutMs');
   }
 
   if (issues.length > 0) throw new MeshConfigError(issues);
-  return { nodeId, rpc, http, peers, electionTimeoutMs, heartbeatIntervalMs, requestTimeoutMs };
+  return {
+    nodeId,
+    rpc,
+    http,
+    peers,
+    electionTimeoutMs,
+    heartbeatIntervalMs,
+    requestTimeoutMs,
+    ...(dataDir === undefined ? {} : { dataDir }),
+  };
 }
 
 /**

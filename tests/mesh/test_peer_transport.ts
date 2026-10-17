@@ -479,10 +479,11 @@ describe('three nodes over real sockets', () => {
     if (leader === undefined) throw new Error('no leader');
 
     leader.node.proposeCommand('SET', { key: 'a', value: 1 });
-    await waitFor(() => [...live.values()].every((member) => member.node.commitIndex === 1));
+    // The leader's barrier (index 1) commits with the command (index 2).
+    await waitFor(() => [...live.values()].every((member) => member.node.commitIndex === 2));
 
     for (const member of live.values()) {
-      expect(member.node.log.map((e) => e.command)).toEqual(['SET']);
+      expect(member.node.log.map((e) => e.command)).toEqual(['BARRIER', 'SET']);
       expect(member.node.leaderId).toBe(leader.id);
     }
   });

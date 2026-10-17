@@ -28,6 +28,7 @@ import {
   type VoteRequest,
   type VoteResponse,
 } from './consensus.js';
+import { BARRIER_COMMAND } from './state_machine.js';
 
 /** Identifies a scheduled task so that it can be cancelled. */
 export type TimerId = number;
@@ -72,6 +73,11 @@ export interface DriverOptions {
    * snapshot index. Throwing counts as not installed.
    */
   installSnapshot?: (snapshot: SnapshotOffer) => boolean;
+  /**
+   * Writes the node's durable state. Called after every change to the term, the vote, the log or the
+   * snapshot, and before the driver answers a peer. If it throws, the driver stops for good.
+   */
+  persist?: () => void;
 }
 
 function assertPositiveInteger(name: string, value: number): void {
@@ -91,6 +97,9 @@ export class ConsensusDriver {
   private readonly onCommitAdvance: (() => void) | undefined;
   private readonly snapshotSource: (() => SnapshotOffer | undefined) | undefined;
   private readonly installSnapshotFn: ((snapshot: SnapshotOffer) => boolean) | undefined;
+  private readonly persistFn: (() => void) | undefined;
+  /** Set after a failed write. A failed driver answers no more peers. */
+  private failed = false;
   private readonly peers: readonly string[];
 
   private started = false;
@@ -120,6 +129,7 @@ export class ConsensusDriver {
     this.onCommitAdvance = options.onCommitAdvance;
     this.snapshotSource = options.snapshotSource;
     this.installSnapshotFn = options.installSnapshot;
+    this.persistFn = options.persist;
     this.peers = options.node.peerIds;
   }
 
@@ -145,7 +155,9 @@ export class ConsensusDriver {
 
   /** Handles a RequestVote from a candidate and returns the vote decision. */
   handleVoteRequest(request: VoteRequest): VoteResponse {
+    this.assertUsable();
     const reply = this.node.requestVote(request.term, request.candidateId, request.lastLogIndex, request.lastLogTerm);
+    this.persistState();
     this.syncRole();
     if (reply.voteGranted) this.resetElectionTimer();
     return reply;
@@ -153,12 +165,14 @@ export class ConsensusDriver {
 
   /** Handles an AppendEntries from the leader and returns the reply. */
   handleAppendRequest(request: AppendRequest): AppendReply {
+    this.assertUsable();
     const before = this.node.commitIndex;
     const reply = this.node.appendEntries(request.term, request.leaderId, request.entries, {
       prevLogIndex: request.prevLogIndex,
       prevLogTerm: request.prevLogTerm,
       leaderCommit: request.leaderCommit,
     });
+    this.persistState();
     if (this.node.commitIndex !== before) this.onCommitAdvance?.();
     this.syncRole();
     // A reply in the leader's own term means the leader is current, even if the entries were rejected.
@@ -168,6 +182,7 @@ export class ConsensusDriver {
 
   /** Handles an InstallSnapshot from the leader: records the leader, then adopts the snapshot. */
   handleSnapshotRequest(request: InstallSnapshotRequest): InstallSnapshotReply {
+    this.assertUsable();
     if (!this.node.recognizeLeader(request.term, request.leaderId)) {
       return { term: this.node.currentTerm, installed: false };
     }
@@ -178,6 +193,7 @@ export class ConsensusDriver {
     } catch (error) {
       this.report(error, 'installSnapshot');
     }
+    this.persistState();
     // The leader is current whether or not the snapshot could be installed.
     this.syncRole();
     this.resetElectionTimer();
@@ -212,6 +228,11 @@ export class ConsensusDriver {
       this.report(error, 'startElection');
       return;
     }
+    try {
+      this.persistState();
+    } catch {
+      return; // persistState has already reported the failure and stopped the driver.
+    }
     if (election.won) {
       this.becomeLeader();
       return;
@@ -227,7 +248,9 @@ export class ConsensusDriver {
     try {
       const reply = await this.transport.requestVote(peer, request);
       if (!this.started) return;
-      if (this.node.recordVote(peer, reply)) this.becomeLeader();
+      const won = this.node.recordVote(peer, reply);
+      this.persistState();
+      if (won) this.becomeLeader();
     } catch (error) {
       this.report(error, `requestVote ${peer}`);
     }
@@ -235,6 +258,15 @@ export class ConsensusDriver {
 
   private becomeLeader(): void {
     this.cancelElectionTimer();
+    // Append a barrier first, so that entries from earlier terms can commit (Raft section 5.4.2).
+    // A one-node cluster commits it at once, so the host must then apply it.
+    try {
+      this.node.proposeCommand(BARRIER_COMMAND, {});
+      this.persistState();
+    } catch {
+      return; // A failed write has already stopped the driver; any other failure leaves it without a leader.
+    }
+    this.onCommitAdvance?.();
     // The first heartbeat asserts leadership straight away; the timer then keeps it going.
     void this.replicateToPeers();
     this.scheduleHeartbeat();
@@ -283,6 +315,7 @@ export class ConsensusDriver {
       if (!this.started) return;
       const before = this.node.commitIndex;
       this.node.handleAppendReply(peer, request, reply);
+      this.persistState();
       if (this.node.commitIndex !== before) this.onCommitAdvance?.();
       this.syncRole();
     } catch (error) {
@@ -305,6 +338,7 @@ export class ConsensusDriver {
       const reply = await this.transport.installSnapshot(peer, request);
       if (!this.started) return;
       this.node.handleSnapshotReply(peer, request.term, snapshot.index, reply);
+      this.persistState();
       this.syncRole();
     } catch (error) {
       this.report(error, `installSnapshot ${peer}`);
@@ -318,6 +352,29 @@ export class ConsensusDriver {
     if (this.node.state === 'LEADER') return;
     this.cancelHeartbeat();
     if (this.started && this.electionTimer === undefined) this.resetElectionTimer();
+  }
+
+  /**
+   * Writes the node's durable state through the persist hook, if one is configured. A failed write
+   * stops the driver for good: the node's memory may be ahead of its disk, so it must not answer
+   * or send anything else.
+   *
+   * @throws {Error} The write error, after the driver has stopped.
+   */
+  persistState(): void {
+    if (this.persistFn === undefined) return;
+    try {
+      this.persistFn();
+    } catch (error) {
+      this.failed = true;
+      this.report(error, 'persist');
+      this.stop();
+      throw error;
+    }
+  }
+
+  private assertUsable(): void {
+    if (this.failed) throw new Error('node stopped after a failed write to its state file');
   }
 
   private report(error: unknown, where: string): void {

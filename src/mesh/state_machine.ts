@@ -20,7 +20,14 @@ export const MAX_KEY_LENGTH = 256;
 
 export type Command =
   | { readonly op: 'SET'; readonly key: string; readonly value: unknown }
-  | { readonly op: 'DELETE'; readonly key: string };
+  | { readonly op: 'DELETE'; readonly key: string }
+  | { readonly op: 'BARRIER' };
+
+/**
+ * Appended by a new leader before it accepts writes. Changes nothing. Committing it commits every
+ * entry from earlier terms, which Raft cannot commit by counting replicas alone.
+ */
+export const BARRIER_COMMAND = 'BARRIER';
 
 export type ParseResult =
   | { readonly ok: true; readonly command: Command }
@@ -37,6 +44,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Turns a log entry into a command, or says why it is not one. */
 export function parseCommand(entry: LogEntry): ParseResult {
+  if (entry.command === BARRIER_COMMAND) return { ok: true, command: { op: 'BARRIER' } };
   if (!isRecord(entry.payload)) return { ok: false, reason: 'payload must be an object' };
   const { key } = entry.payload;
   if (typeof key !== 'string' || key.length === 0 || key.length > MAX_KEY_LENGTH) {
@@ -101,10 +109,15 @@ export class KeyValueStore {
     }
 
     const { command } = parsed;
-    if (command.op === 'SET') {
-      this.data.set(command.key, structuredClone(command.value));
-    } else {
-      this.data.delete(command.key);
+    switch (command.op) {
+      case 'SET':
+        this.data.set(command.key, structuredClone(command.value));
+        break;
+      case 'DELETE':
+        this.data.delete(command.key);
+        break;
+      case 'BARRIER':
+        break;
     }
     return 'applied';
   }

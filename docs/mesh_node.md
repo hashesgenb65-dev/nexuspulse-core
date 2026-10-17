@@ -59,10 +59,23 @@ Once a node has applied `compactThreshold` entries above its last snapshot (defa
 
 - The threshold is set per process with `startMeshNode(config, { compactThreshold })`. It is not part of the config file yet.
 - The snapshot must fit in one peer frame (1 MiB by default). A store with a large value set can exceed that. The leader then fails to send the snapshot and reports the error. Raising the frame limit or chunking the snapshot is the fix if that happens.
-- Snapshots are kept in memory only. A restarted node starts empty and catches up from the leader's snapshot, because nothing is persisted to disk yet.
+- Snapshots are saved to the state file too (see Durable state below).
+
+## Durable state
+
+Set `dataDir` in the config to keep the node's term, vote, log and latest snapshot in `<dataDir>/state.json`. The file is rewritten atomically after every change, and always before the node answers a peer. A restarted node reads it back and rejoins the cluster with its term intact, so it cannot vote twice in one term.
+
+- Without `dataDir` the node keeps nothing across restarts and catches up from the leader instead.
+- A corrupt state file stops start-up before any port is bound. Fix or remove the file to start fresh; removing it means the node may vote again in a term it already voted in, so only do that when the rest of the cluster is healthy.
+- If a write fails (for example, the disk is full), the node stops answering peers and must be restarted.
+
+## Leader barrier
+
+A new leader appends a `BARRIER` entry before it accepts writes. It changes nothing in the store, but committing it commits every entry from earlier terms. Without it, entries from an earlier term could stay uncommitted after a failover until the next write.
+
+Because the barrier takes index 1 in a fresh cluster, the first client write is index 2.
 
 ## Not included
 
 - **No authentication** on the HTTP API or the peer RPCs. Bind both to a trusted network only.
-- **No durable storage.** Restarting a node loses its data until it catches up from a leader. A cluster that restarts all at once loses everything.
 - **Reads are not linearizable.** A GET on a follower can return an older value.

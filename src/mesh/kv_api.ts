@@ -40,6 +40,8 @@ export interface KvApiOptions {
   /** HTTP addresses of the other members, keyed by node id. Used to redirect writes. */
   readonly peerHttp: ReadonlyMap<string, KvPeerHttp>;
   readonly commitTimeoutMs?: number;
+  /** Saves durable state after a write is appended locally, before the write waits for commit. */
+  readonly persist?: () => void;
 }
 
 export interface KvRequest {
@@ -111,6 +113,7 @@ export class KvApi {
   private readonly applier: { applyCommitted(): number };
   private readonly peerHttp: ReadonlyMap<string, KvPeerHttp>;
   private readonly commitTimeoutMs: number;
+  private readonly persist: (() => void) | undefined;
 
   constructor(options: KvApiOptions) {
     this.node = options.node;
@@ -118,6 +121,7 @@ export class KvApi {
     this.applier = options.applier;
     this.peerHttp = options.peerHttp;
     this.commitTimeoutMs = options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS;
+    this.persist = options.persist;
   }
 
   /** Answers one request. Never throws: unexpected errors become a 500 without details. */
@@ -169,6 +173,7 @@ export class KvApi {
     } catch {
       return failure(503, 'leadership changed; retry', { 'retry-after': '1' });
     }
+    this.persist?.();
     return this.awaitCommit(entry, path);
   }
 

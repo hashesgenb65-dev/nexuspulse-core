@@ -14,6 +14,7 @@ import type { MeshNodeConfig } from './node_config.js';
 import { PeerServer, TcpPeerTransport, systemScheduler } from './peer_transport.js';
 import { KeyValueStore } from './state_machine.js';
 import { DEFAULT_COMPACT_THRESHOLD, StateHost } from './snapshot.js';
+import { DurableStateFile, NodePersister, restoreNode } from './durable_store.js';
 
 export interface MeshNodeHandle {
   readonly nodeId: string;
@@ -90,6 +91,14 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     store,
     compactThreshold: options.compactThreshold ?? DEFAULT_COMPACT_THRESHOLD,
   });
+  // Restore what was saved before the driver starts. A corrupt file stops start-up here, before any port is bound.
+  const durableFile = config.dataDir === undefined ? undefined : new DurableStateFile(config.dataDir);
+  const saved = durableFile?.load();
+  if (saved !== undefined) restoreNode(saved, node, host);
+  const persister =
+    durableFile === undefined ? undefined : new NodePersister({ file: durableFile, node, host });
+  if (persister !== undefined && saved !== undefined) persister.markSaved();
+
   const driver = new ConsensusDriver({
     node,
     transport,
@@ -100,9 +109,12 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     onError: options.onError,
     onCommitAdvance: () => {
       host.applyCommitted();
+      // Compaction may have changed the log, so save again.
+      driver.persistState();
     },
     snapshotSource: () => host.latestSnapshot,
     installSnapshot: (snapshot) => host.install(snapshot),
+    persist: persister === undefined ? undefined : () => persister.save(),
   });
 
   const rpcServer = new PeerServer({
@@ -118,6 +130,7 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     applier: host,
     peerHttp,
     commitTimeoutMs: options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS,
+    persist: () => driver.persistState(),
   });
   const httpServer = createKvServer(api);
 

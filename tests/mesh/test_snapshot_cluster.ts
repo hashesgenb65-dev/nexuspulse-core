@@ -98,7 +98,8 @@ describe('snapshot catch-up over real sockets', () => {
       leader.node.proposeCommand('SET', { key: `k${i}`, value: { n: i } });
     }
     const survivors = [...handles.values()];
-    await waitFor(() => survivors.every((h) => h.store.lastApplied === 20));
+    // The leader's barrier is index 1, so the twenty writes end at index 21.
+    await waitFor(() => survivors.every((h) => h.store.lastApplied === 21));
     await waitFor(() => leader.node.snapshotIndex > 0);
     expect(leader.node.snapshotIndex).toBeGreaterThan(0);
 
@@ -106,7 +107,7 @@ describe('snapshot catch-up over real sockets', () => {
     const restarted = await start(laggardConfig);
     handles.set(restarted.nodeId, restarted);
 
-    await waitFor(() => restarted.store.lastApplied === 20).catch((error: unknown) => {
+    await waitFor(() => restarted.store.lastApplied === 21).catch((error: unknown) => {
       const state = { restarted: restarted.node.getStateSummary(), leader: leader.node.getStateSummary() };
       throw new Error(`${String(error)}\n${JSON.stringify(state, null, 1)}\nreported:\n${reported.join('\n')}`);
     });
@@ -124,7 +125,7 @@ describe('snapshot catch-up over real sockets', () => {
       };
       throw new Error(`${String(error)}\n${JSON.stringify(state, null, 1)}\nreported:\n${reported.join('\n')}`);
     });
-    expect(restarted.store.lastApplied).toBe(21);
+    expect(restarted.store.lastApplied).toBe(22);
     expect(restarted.node.leaderId).toBe(leader.node.nodeId);
   }, 20_000);
 });

@@ -72,19 +72,38 @@ export class StateHost {
   install(snapshot: SnapshotOffer): boolean {
     if (snapshot.index <= this.store.lastApplied) return true;
 
-    // Restore into a staging store first, so a bad snapshot leaves this node's state untouched.
+    const image = this.restoreStore(snapshot);
+    if (!this.node.installSnapshot(snapshot.index, snapshot.term)) return false;
+
+    this.latest = { index: snapshot.index, term: snapshot.term, data: image };
+    return true;
+  }
+
+  /**
+   * Restores the store from a snapshot read from disk, at start-up. The consensus node is not
+   * touched: the caller sets its fields to match.
+   *
+   * @throws {TypeError} If the snapshot data is malformed.
+   * @throws {Error} If the data does not end at the snapshot index.
+   */
+  load(snapshot: SnapshotOffer): void {
+    const image = this.restoreStore(snapshot);
+    this.latest = { index: snapshot.index, term: snapshot.term, data: image };
+  }
+
+  /**
+   * Restores the store to a snapshot. It restores into a staging store first, so a bad snapshot
+   * leaves this node's state untouched.
+   */
+  private restoreStore(snapshot: SnapshotOffer): StoreImage {
     const staging = new KeyValueStore();
     staging.restore(snapshot.data);
     if (staging.lastApplied !== snapshot.index) {
       throw new Error(`snapshot data ends at ${staging.lastApplied}, expected ${snapshot.index}`);
     }
     const image = staging.image();
-
     this.store.restore(image);
-    if (!this.node.installSnapshot(snapshot.index, snapshot.term)) return false;
-
-    this.latest = { index: snapshot.index, term: snapshot.term, data: image };
-    return true;
+    return image;
   }
 
   private maybeCompact(): void {

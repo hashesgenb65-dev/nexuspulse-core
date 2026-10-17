@@ -304,13 +304,14 @@ describe('replication through the timers', () => {
 
     nodeOf(cluster, 'node_1').proposeCommand('SET', { x: 1 });
     await cluster.scheduler.advance(HEARTBEAT_MS);
-    expect(nodeOf(cluster, 'node_2').log).toHaveLength(1);
-    expect(nodeOf(cluster, 'node_1').commitIndex).toBe(1);
+    // Index 1 is the barrier the leader appends on election, so the command is index 2.
+    expect(nodeOf(cluster, 'node_2').log).toHaveLength(2);
+    expect(nodeOf(cluster, 'node_1').commitIndex).toBe(2);
 
     // Followers learn the commit index from the heartbeat after that.
     await cluster.scheduler.advance(HEARTBEAT_MS);
-    expect(nodeOf(cluster, 'node_2').commitIndex).toBe(1);
-    expect(nodeOf(cluster, 'node_3').commitIndex).toBe(1);
+    expect(nodeOf(cluster, 'node_2').commitIndex).toBe(2);
+    expect(nodeOf(cluster, 'node_3').commitIndex).toBe(2);
   });
 
   it('catches up a follower that was cut off while entries were committed', async () => {
@@ -326,12 +327,13 @@ describe('replication through the timers', () => {
     nodeOf(cluster, 'node_1').proposeCommand('SET', { n: 2 });
     nodeOf(cluster, 'node_1').proposeCommand('SET', { n: 3 });
     await cluster.scheduler.advance(100);
-    expect(nodeOf(cluster, 'node_3').log).toHaveLength(1);
+    // Barrier (1) and the first command (2) are on node_3; the two cut-off commands are not.
+    expect(nodeOf(cluster, 'node_3').log).toHaveLength(2);
 
     cluster.network.heal('node_3');
     await cluster.scheduler.advance(200);
-    expect(nodeOf(cluster, 'node_3').log.map((e) => e.index)).toEqual([1, 2, 3]);
-    expect(nodeOf(cluster, 'node_1').commitIndex).toBe(3);
+    expect(nodeOf(cluster, 'node_3').log.map((e) => e.index)).toEqual([1, 2, 3, 4]);
+    expect(nodeOf(cluster, 'node_1').commitIndex).toBe(4);
     expect(cluster.stateOf('node_1')).toBe('LEADER');
   });
 });
