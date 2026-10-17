@@ -65,6 +65,17 @@ Once a node has applied `compactThreshold` entries above its last snapshot (defa
 - The snapshot must fit in one peer frame (1 MiB by default). A store with a large value set can exceed that. The leader then fails to send the snapshot and reports the error. Raising the frame limit or chunking the snapshot is the fix if that happens.
 - Snapshots are saved to the state file too (see Durable state below).
 
+## Peer authentication
+
+A member with peers must set `peerSecretFile` in its config. The file holds a cluster secret as hex text, at least 32 bytes, and must not be readable by group or others (`chmod 600`). Every member must use the same secret.
+
+Each frame between members carries an HMAC-SHA256 tag over its whole contents, plus a timestamp. A frame without a valid tag, or with a timestamp more than 30 seconds from the receiver's clock, is refused. A server drops the connection on a bad request; a client fails the request with `AUTH_FAILED` on a bad reply.
+
+- Keep the members' clocks within a few seconds of each other (NTP), or valid frames will be refused as stale.
+- A captured frame can be replayed within the 30-second window. Raft tolerates this, but it is a reason to keep the window short.
+- Peer traffic is still plain TCP. The tags stop forgery and tampering, not eavesdropping. Use a private network or a tunnel until TLS is added.
+- The secret authenticates members to one another. It does not protect the HTTP API, which has no authentication.
+
 ## Durable state
 
 Set `dataDir` in the config to keep the node's term, vote, log and latest snapshot in `<dataDir>/state.json`. The file is rewritten atomically after every change, and always before the node answers a peer. A restarted node reads it back and rejoins the cluster with its term intact, so it cannot vote twice in one term.
