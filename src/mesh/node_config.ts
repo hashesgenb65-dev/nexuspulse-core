@@ -54,6 +54,8 @@ export interface MeshNodeConfig {
   readonly requestTimeoutMs: number;
   /** Directory for the durable state file. Without it the node keeps nothing across restarts. */
   readonly dataDir?: string;
+  /** File holding the cluster secret (hex, at least 32 bytes, readable only by its owner). Required when there are peers. */
+  readonly peerSecretFile?: string;
 }
 
 export interface ConfigIssue {
@@ -185,6 +187,12 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     else report('dataDir', 'must be a non-empty string');
   }
 
+  let peerSecretFile: string | undefined;
+  if (raw.peerSecretFile !== undefined) {
+    if (typeof raw.peerSecretFile === 'string' && raw.peerSecretFile.length > 0) peerSecretFile = raw.peerSecretFile;
+    else report('peerSecretFile', 'must be a non-empty string');
+  }
+
   if (heartbeatIntervalMs >= electionTimeoutMs) {
     report('heartbeatIntervalMs', 'must be shorter than electionTimeoutMs');
   }
@@ -199,6 +207,7 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     heartbeatIntervalMs,
     requestTimeoutMs,
     ...(dataDir === undefined ? {} : { dataDir }),
+    ...(peerSecretFile === undefined ? {} : { peerSecretFile }),
   };
 }
 

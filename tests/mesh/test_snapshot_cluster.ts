@@ -5,12 +5,23 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
+import * as fs from 'node:fs';
 import * as net from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { parseNodeConfig, type MeshNodeConfig } from '../../src/mesh/node_config';
 import { startMeshNode, type MeshNodeHandle } from '../../src/mesh/node_runner';
 
 const HOST = '127.0.0.1';
+
+/** A valid cluster secret in a file only its owner can read. */
+function writeSecret(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-secret-'));
+  const file = path.join(dir, 'peer.secret');
+  fs.writeFileSync(file, 'ab'.repeat(32), { mode: 0o600 });
+  return file;
+}
 const COMPACT_THRESHOLD = 5;
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -49,8 +60,10 @@ async function buildConfigs(): Promise<MeshNodeConfig[]> {
     rpc.set(id, await freePort());
     http.set(id, await freePort());
   }
+  const secretPath = writeSecret();
   return ids.map((id) =>
     parseNodeConfig({
+      peerSecretFile: secretPath,
       nodeId: id,
       rpc: { host: HOST, port: rpc.get(id) },
       http: { host: HOST, port: http.get(id) },

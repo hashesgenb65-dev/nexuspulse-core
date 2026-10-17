@@ -15,6 +15,7 @@ import { PeerServer, TcpPeerTransport, systemScheduler } from './peer_transport.
 import { KeyValueStore } from './state_machine.js';
 import { DEFAULT_COMPACT_THRESHOLD, StateHost } from './snapshot.js';
 import { DurableStateFile, NodePersister, restoreNode } from './durable_store.js';
+import { loadPeerSecret, PeerAuthError } from './peer_auth.js';
 
 export interface MeshNodeHandle {
   readonly nodeId: string;
@@ -67,6 +68,12 @@ function closeHttp(server: http.Server): Promise<void> {
  * @throws {Error} If either listener cannot bind, for example because the port is in use.
  */
 export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNodeOptions = {}): Promise<MeshNodeHandle> {
+  // A cluster member must authenticate its peers. Check this before anything is bound or written.
+  if (config.peers.length > 0 && config.peerSecretFile === undefined) {
+    throw new PeerAuthError('a node with peers needs peerSecretFile, so that peer traffic is authenticated');
+  }
+  const secret = config.peerSecretFile === undefined ? undefined : loadPeerSecret(config.peerSecretFile);
+
   const peerAddresses: Record<string, { host: string; port: number }> = {};
   const peerHttp = new Map<string, KvPeerHttp>();
   for (const peer of config.peers) {
@@ -78,6 +85,7 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     peers: peerAddresses,
     requestTimeoutMs: config.requestTimeoutMs,
     connectTimeoutMs: config.requestTimeoutMs,
+    secret,
   });
   const node = new RaftConsensusNode({
     nodeId: config.nodeId,
@@ -118,6 +126,7 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
   });
 
   const rpcServer = new PeerServer({
+    secret,
     handler: {
       handleVoteRequest: (request) => driver.handleVoteRequest(request),
       handleAppendRequest: (request) => driver.handleAppendRequest(request),
