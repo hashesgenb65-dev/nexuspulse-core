@@ -131,6 +131,7 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     peerHttp,
     commitTimeoutMs: options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS,
     persist: () => driver.persistState(),
+    durable: persister !== undefined,
   });
   const httpServer = createKvServer(api);
 

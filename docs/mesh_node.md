@@ -45,6 +45,10 @@ It exits with 2 for a bad config and 1 if it cannot bind its ports. On SIGINT or
 
 Keys are 1 to 256 characters after URL decoding. Bodies are limited to 64 KiB.
 
+### Status
+
+`GET /v1/status` reports this member's view of the cluster: role, term, leader, vote, log and commit indexes, applied index, snapshot index, peers, quorum size, and whether state is durable. It reads local state only and does not contact peers, so a stale or partitioned member reports what it last knew.
+
 Writes go through the leader:
 
 - A follower answers **307** with the leader's address in `location`. Repeat the same request there.

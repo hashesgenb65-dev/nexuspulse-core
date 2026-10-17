@@ -20,6 +20,7 @@ import * as http from 'node:http';
 import type { LogEntry, RaftConsensusNode } from './consensus.js';
 import type { KeyValueStore } from './state_machine.js';
 import { MAX_KEY_LENGTH } from './state_machine.js';
+import { nodeStatus, STATUS_PATH } from './status.js';
 
 export const KV_PATH_PREFIX = '/v1/kv/';
 export const MAX_KV_BODY_BYTES = 64 * 1024;
@@ -42,6 +43,8 @@ export interface KvApiOptions {
   readonly commitTimeoutMs?: number;
   /** Saves durable state after a write is appended locally, before the write waits for commit. */
   readonly persist?: () => void;
+  /** Whether this member writes its state to disk. Reported by GET /v1/status. */
+  readonly durable?: boolean;
 }
 
 export interface KvRequest {
@@ -114,6 +117,7 @@ export class KvApi {
   private readonly peerHttp: ReadonlyMap<string, KvPeerHttp>;
   private readonly commitTimeoutMs: number;
   private readonly persist: (() => void) | undefined;
+  private readonly durable: boolean;
 
   constructor(options: KvApiOptions) {
     this.node = options.node;
@@ -122,6 +126,7 @@ export class KvApi {
     this.peerHttp = options.peerHttp;
     this.commitTimeoutMs = options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS;
     this.persist = options.persist;
+    this.durable = options.durable ?? false;
   }
 
   /** Answers one request. Never throws: unexpected errors become a 500 without details. */
@@ -135,6 +140,10 @@ export class KvApi {
 
   private async route(request: KvRequest): Promise<KvResponse> {
     const path = request.url.split('?')[0] ?? '';
+    if (path === STATUS_PATH) {
+      if (request.method !== 'GET') return failure(405, 'method not allowed', { allow: 'GET' });
+      return json(200, nodeStatus(this.node, this.store, this.durable));
+    }
     if (!path.startsWith(KV_PATH_PREFIX)) return failure(404, 'not found');
 
     const key = keyFromPath(path);
