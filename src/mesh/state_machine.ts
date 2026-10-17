@@ -117,6 +117,60 @@ export class KeyValueStore {
     }
     return out;
   }
+
+  /**
+   * A complete copy of the store at lastApplied: the data, and the rejected-entry record. It is
+   * plain JSON data, so it can be sent to another node.
+   */
+  image(): StoreImage {
+    return {
+      lastApplied: this.applied,
+      data: this.snapshot(),
+      rejected: structuredClone([...this.rejectedEntries]),
+    };
+  }
+
+  /**
+   * Replaces the whole store with an image made by {@link KeyValueStore.image}. Values are copied
+   * in, so the image can be reused. Every check runs before any change is made.
+   *
+   * @throws {TypeError} If the image does not have the expected shape.
+   */
+  restore(image: unknown): void {
+    if (!isStoreImage(image)) throw new TypeError('not a store image');
+
+    const data = new Map<string, unknown>();
+    for (const [key, value] of Object.entries(image.data)) data.set(key, structuredClone(value));
+    const rejected = image.rejected.map((entry) => ({ index: entry.index, reason: entry.reason }));
+
+    this.data.clear();
+    for (const [key, value] of data) this.data.set(key, value);
+    this.applied = image.lastApplied;
+    this.rejectedEntries.splice(0, this.rejectedEntries.length, ...rejected);
+  }
+}
+
+/** The complete state of a {@link KeyValueStore} at one index. */
+export interface StoreImage {
+  readonly lastApplied: number;
+  readonly data: Record<string, unknown>;
+  readonly rejected: readonly RejectedEntry[];
+}
+
+function isStoreImage(value: unknown): value is StoreImage {
+  if (!isRecord(value)) return false;
+  if (typeof value.lastApplied !== 'number' || !Number.isInteger(value.lastApplied) || value.lastApplied < 0) {
+    return false;
+  }
+  if (!isRecord(value.data)) return false;
+  if (!Array.isArray(value.rejected)) return false;
+  return value.rejected.every(
+    (entry) =>
+      isRecord(entry) &&
+      typeof entry.index === 'number' &&
+      Number.isInteger(entry.index) &&
+      typeof entry.reason === 'string',
+  );
 }
 
 /**
@@ -142,8 +196,9 @@ export class CommitApplier {
     let count = 0;
     while (this.store.lastApplied < this.node.commitIndex) {
       const next = this.store.lastApplied + 1;
-      const entry = this.node.log[next - 1];
-      if (entry === undefined || entry.index !== next) {
+      // Look up by index, not position: after compaction, position 0 of the log is not index 1.
+      const entry = this.node.entryAt(next);
+      if (entry === undefined) {
         throw new Error(`committed entry ${next} is missing from the log`);
       }
       this.store.apply(entry);

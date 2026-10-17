@@ -91,6 +91,10 @@ class FakeNetwork {
         this.checkReachable(from, to);
         return this.target(to).handleAppendRequest(request);
       },
+      installSnapshot: async (to, request) => {
+        this.checkReachable(from, to);
+        return this.target(to).handleSnapshotRequest(request);
+      },
     };
   }
 
@@ -205,7 +209,11 @@ describe('timing', () => {
     });
     const driver = new ConsensusDriver({
       node,
-      transport: { requestVote: () => new Promise(() => {}), appendEntries: () => new Promise(() => {}) },
+      transport: {
+        requestVote: () => new Promise(() => {}),
+        appendEntries: () => new Promise(() => {}),
+        installSnapshot: () => new Promise(() => {}),
+      },
       scheduler,
       electionTimeoutMs: ELECTION_MS,
       heartbeatIntervalMs: HEARTBEAT_MS,
@@ -382,7 +390,11 @@ describe('lifecycle and errors', () => {
       () =>
         new ConsensusDriver({
           node,
-          transport: { requestVote: async () => ({ term: 0, voteGranted: false }), appendEntries: async () => ({ term: 0, success: false }) },
+          transport: {
+            requestVote: async () => ({ term: 0, voteGranted: false }),
+            appendEntries: async () => ({ term: 0, success: false }),
+            installSnapshot: async () => ({ term: 0, installed: false }),
+          },
           scheduler: new ManualScheduler(),
           electionTimeoutMs: ELECTION_MS,
           heartbeatIntervalMs: ELECTION_MS,
@@ -399,7 +411,11 @@ describe('lifecycle and errors', () => {
     });
     const base = {
       node,
-      transport: { requestVote: async () => ({ term: 0, voteGranted: false }), appendEntries: async () => ({ term: 0, success: false }) },
+      transport: {
+        requestVote: async () => ({ term: 0, voteGranted: false }),
+        appendEntries: async () => ({ term: 0, success: false }),
+        installSnapshot: async () => ({ term: 0, installed: false }),
+      },
       scheduler: new ManualScheduler(),
     };
     expect(() => new ConsensusDriver({ ...base, electionTimeoutMs: 0, heartbeatIntervalMs: 0 })).toThrowError(

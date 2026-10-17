@@ -12,7 +12,8 @@ import { ConsensusDriver } from './driver.js';
 import { DEFAULT_COMMIT_TIMEOUT_MS, KvApi, createKvServer, type KvPeerHttp } from './kv_api.js';
 import type { MeshNodeConfig } from './node_config.js';
 import { PeerServer, TcpPeerTransport, systemScheduler } from './peer_transport.js';
-import { CommitApplier, KeyValueStore } from './state_machine.js';
+import { KeyValueStore } from './state_machine.js';
+import { DEFAULT_COMPACT_THRESHOLD, StateHost } from './snapshot.js';
 
 export interface MeshNodeHandle {
   readonly nodeId: string;
@@ -32,6 +33,8 @@ export interface StartMeshNodeOptions {
   random?: () => number;
   /** How long a write waits to commit before it answers 504. */
   commitTimeoutMs?: number;
+  /** Applied entries kept in the log before they are folded into a snapshot. */
+  compactThreshold?: number;
 }
 
 function listenHttp(server: http.Server, port: number, host: string): Promise<number> {
@@ -82,7 +85,11 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     heartbeatIntervalMs: config.heartbeatIntervalMs,
   });
   const store = new KeyValueStore();
-  const applier = new CommitApplier(node, store);
+  const host = new StateHost({
+    node,
+    store,
+    compactThreshold: options.compactThreshold ?? DEFAULT_COMPACT_THRESHOLD,
+  });
   const driver = new ConsensusDriver({
     node,
     transport,
@@ -92,20 +99,23 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     random: options.random,
     onError: options.onError,
     onCommitAdvance: () => {
-      applier.applyCommitted();
+      host.applyCommitted();
     },
+    snapshotSource: () => host.latestSnapshot,
+    installSnapshot: (snapshot) => host.install(snapshot),
   });
 
   const rpcServer = new PeerServer({
     handler: {
       handleVoteRequest: (request) => driver.handleVoteRequest(request),
       handleAppendRequest: (request) => driver.handleAppendRequest(request),
+      handleSnapshotRequest: (request) => driver.handleSnapshotRequest(request),
     },
   });
   const api = new KvApi({
     node,
     store,
-    applier,
+    applier: host,
     peerHttp,
     commitTimeoutMs: options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS,
   });

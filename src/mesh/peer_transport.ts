@@ -18,7 +18,15 @@
  */
 
 import * as net from 'node:net';
-import type { AppendReply, AppendRequest, LogEntry, VoteRequest, VoteResponse } from './consensus.js';
+import type {
+  AppendReply,
+  AppendRequest,
+  InstallSnapshotReply,
+  InstallSnapshotRequest,
+  LogEntry,
+  VoteRequest,
+  VoteResponse,
+} from './consensus.js';
 import type { PeerTransport, Scheduler, TimerId } from './driver.js';
 
 export const DEFAULT_MAX_FRAME_BYTES = 1 << 20;
@@ -110,7 +118,7 @@ export class FrameDecoder {
 // Validation of wire values
 // ---------------------------------------------------------------------------
 
-type Method = 'requestVote' | 'appendEntries';
+type Method = 'requestVote' | 'appendEntries' | 'installSnapshot';
 
 interface RequestFrame {
   readonly id: number;
@@ -166,6 +174,21 @@ function isAppendRequest(value: unknown): value is AppendRequest {
   );
 }
 
+function isInstallSnapshotRequest(value: unknown): value is InstallSnapshotRequest {
+  if (!isRecord(value) || !isNonNegativeInteger(value.term) || typeof value.leaderId !== 'string') return false;
+  const { snapshot } = value;
+  return (
+    isRecord(snapshot) &&
+    isNonNegativeInteger(snapshot.index) &&
+    isNonNegativeInteger(snapshot.term) &&
+    'data' in snapshot
+  );
+}
+
+function isInstallSnapshotReply(value: unknown): value is InstallSnapshotReply {
+  return isRecord(value) && isNonNegativeInteger(value.term) && typeof value.installed === 'boolean';
+}
+
 function isVoteResponse(value: unknown): value is VoteResponse {
   return isRecord(value) && isNonNegativeInteger(value.term) && typeof value.voteGranted === 'boolean';
 }
@@ -181,6 +204,9 @@ function parseRequest(message: unknown): RequestFrame | undefined {
   }
   if (message.method === 'appendEntries' && isAppendRequest(message.body)) {
     return { id: message.id, method: 'appendEntries', body: message.body };
+  }
+  if (message.method === 'installSnapshot' && isInstallSnapshotRequest(message.body)) {
+    return { id: message.id, method: 'installSnapshot', body: message.body };
   }
   return undefined;
 }
@@ -206,6 +232,8 @@ function describe(error: unknown): string {
 export interface RpcHandler {
   handleVoteRequest(request: VoteRequest): VoteResponse;
   handleAppendRequest(request: AppendRequest): AppendReply;
+  /** Absent on nodes that do not take snapshots. Such a node answers an installSnapshot with an error. */
+  handleSnapshotRequest?(request: InstallSnapshotRequest): InstallSnapshotReply;
 }
 
 export interface PeerServerOptions {
@@ -293,13 +321,24 @@ export class PeerServer {
     }
 
     try {
-      const body =
-        request.method === 'requestVote'
-          ? this.handler.handleVoteRequest(request.body as VoteRequest)
-          : this.handler.handleAppendRequest(request.body as AppendRequest);
+      const body = this.route(request);
       this.send(socket, { type: 'reply', id: request.id, ok: true, body });
     } catch (error) {
       this.send(socket, { type: 'reply', id: request.id, ok: false, error: describe(error) });
+    }
+  }
+
+  private route(request: RequestFrame): unknown {
+    switch (request.method) {
+      case 'requestVote':
+        return this.handler.handleVoteRequest(request.body as VoteRequest);
+      case 'appendEntries':
+        return this.handler.handleAppendRequest(request.body as AppendRequest);
+      case 'installSnapshot': {
+        const handle = this.handler.handleSnapshotRequest;
+        if (handle === undefined) throw new Error('snapshots are not supported by this node');
+        return handle.call(this.handler, request.body as InstallSnapshotRequest);
+      }
     }
   }
 
@@ -504,6 +543,10 @@ export class TcpPeerTransport implements PeerTransport {
 
   appendEntries(peerId: string, request: AppendRequest): Promise<AppendReply> {
     return this.call(peerId, 'appendEntries', request, isAppendReply);
+  }
+
+  installSnapshot(peerId: string, request: InstallSnapshotRequest): Promise<InstallSnapshotReply> {
+    return this.call(peerId, 'installSnapshot', request, isInstallSnapshotReply);
   }
 
   /** Closes every connection. Requests still waiting are rejected with CLOSED. */

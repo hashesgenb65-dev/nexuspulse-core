@@ -22,6 +22,9 @@ import {
   type AppendReply,
   type AppendRequest,
   type ElectionStart,
+  type InstallSnapshotReply,
+  type InstallSnapshotRequest,
+  type SnapshotOffer,
   type VoteRequest,
   type VoteResponse,
 } from './consensus.js';
@@ -39,6 +42,7 @@ export interface Scheduler {
 export interface PeerTransport {
   requestVote(peerId: string, request: VoteRequest): Promise<VoteResponse>;
   appendEntries(peerId: string, request: AppendRequest): Promise<AppendReply>;
+  installSnapshot(peerId: string, request: InstallSnapshotRequest): Promise<InstallSnapshotReply>;
 }
 
 export interface DriverOptions {
@@ -58,6 +62,16 @@ export interface DriverOptions {
    * with its own apply step.
    */
   onCommitAdvance?: () => void;
+  /**
+   * Returns the snapshot to send to a peer that is behind the compacted log, or undefined if none
+   * exists. Its index must equal the node's snapshotIndex.
+   */
+  snapshotSource?: () => SnapshotOffer | undefined;
+  /**
+   * Adopts a snapshot sent by the leader. Returns true if the host now holds the state through the
+   * snapshot index. Throwing counts as not installed.
+   */
+  installSnapshot?: (snapshot: SnapshotOffer) => boolean;
 }
 
 function assertPositiveInteger(name: string, value: number): void {
@@ -75,11 +89,15 @@ export class ConsensusDriver {
   private readonly random: () => number;
   private readonly onError: ((error: unknown, where: string) => void) | undefined;
   private readonly onCommitAdvance: (() => void) | undefined;
+  private readonly snapshotSource: (() => SnapshotOffer | undefined) | undefined;
+  private readonly installSnapshotFn: ((snapshot: SnapshotOffer) => boolean) | undefined;
   private readonly peers: readonly string[];
 
   private started = false;
   private electionTimer: TimerId | undefined;
   private heartbeatTimer: TimerId | undefined;
+  /** Peers that already have a snapshot on the way, so heartbeats do not send it again. */
+  private readonly snapshotsInFlight = new Set<string>();
 
   /**
    * @throws {RangeError} If either interval is not a positive integer, or if the heartbeat
@@ -100,6 +118,8 @@ export class ConsensusDriver {
     this.random = options.random ?? Math.random;
     this.onError = options.onError;
     this.onCommitAdvance = options.onCommitAdvance;
+    this.snapshotSource = options.snapshotSource;
+    this.installSnapshotFn = options.installSnapshot;
     this.peers = options.node.peerIds;
   }
 
@@ -144,6 +164,24 @@ export class ConsensusDriver {
     // A reply in the leader's own term means the leader is current, even if the entries were rejected.
     if (reply.term === request.term) this.resetElectionTimer();
     return reply;
+  }
+
+  /** Handles an InstallSnapshot from the leader: records the leader, then adopts the snapshot. */
+  handleSnapshotRequest(request: InstallSnapshotRequest): InstallSnapshotReply {
+    if (!this.node.recognizeLeader(request.term, request.leaderId)) {
+      return { term: this.node.currentTerm, installed: false };
+    }
+
+    let installed = false;
+    try {
+      installed = this.installSnapshotFn?.(request.snapshot) ?? false;
+    } catch (error) {
+      this.report(error, 'installSnapshot');
+    }
+    // The leader is current whether or not the snapshot could be installed.
+    this.syncRole();
+    this.resetElectionTimer();
+    return { term: this.node.currentTerm, installed };
   }
 
   private resetElectionTimer(): void {
@@ -227,6 +265,10 @@ export class ConsensusDriver {
 
   private async appendTo(peer: string): Promise<void> {
     if (this.node.state !== 'LEADER') return;
+    if (this.node.peerNeedsSnapshot(peer)) {
+      await this.sendSnapshotTo(peer);
+      return;
+    }
 
     let request: AppendRequest;
     try {
@@ -245,6 +287,29 @@ export class ConsensusDriver {
       this.syncRole();
     } catch (error) {
       this.report(error, `appendEntries ${peer}`);
+    }
+  }
+
+  private async sendSnapshotTo(peer: string): Promise<void> {
+    if (this.snapshotsInFlight.has(peer)) return;
+
+    const snapshot = this.snapshotSource?.();
+    if (snapshot === undefined || snapshot.index !== this.node.snapshotIndex) {
+      this.report(new Error(`peer ${peer} needs a snapshot at ${this.node.snapshotIndex}, but none is available`), 'snapshot');
+      return;
+    }
+
+    const request: InstallSnapshotRequest = { term: this.node.currentTerm, leaderId: this.node.nodeId, snapshot };
+    this.snapshotsInFlight.add(peer);
+    try {
+      const reply = await this.transport.installSnapshot(peer, request);
+      if (!this.started) return;
+      this.node.handleSnapshotReply(peer, request.term, snapshot.index, reply);
+      this.syncRole();
+    } catch (error) {
+      this.report(error, `installSnapshot ${peer}`);
+    } finally {
+      this.snapshotsInFlight.delete(peer);
     }
   }
 

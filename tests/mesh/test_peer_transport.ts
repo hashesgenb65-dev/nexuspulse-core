@@ -276,7 +276,7 @@ describe('server validation', () => {
     const { port } = await startServer(recorder().handler);
     const socket = await connectRaw(port);
 
-    socket.write(encodeFrame({ type: 'request', id: 3, method: 'installSnapshot', body: {} }));
+    socket.write(encodeFrame({ type: 'request', id: 3, method: 'bogusMethod', body: {} }));
     const [reply] = await readFrames(socket, 1);
     expect(reply).toEqual({ type: 'reply', id: 3, ok: false, error: 'invalid request' });
   });

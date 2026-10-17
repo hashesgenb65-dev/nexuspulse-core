@@ -53,8 +53,16 @@ Writes go through the leader:
 - **504**: the write did not commit within 2 seconds. The outcome is unknown.
 - **503**: no leader is known yet. Retry after the `retry-after` delay.
 
+## Snapshots and compaction
+
+Once a node has applied `compactThreshold` entries above its last snapshot (default 1000), it folds the store into a snapshot and drops those entries from its log. The leader keeps its latest snapshot. A peer whose next needed entry was dropped receives that snapshot in an `installSnapshot` RPC, then continues with normal replication.
+
+- The threshold is set per process with `startMeshNode(config, { compactThreshold })`. It is not part of the config file yet.
+- The snapshot must fit in one peer frame (1 MiB by default). A store with a large value set can exceed that. The leader then fails to send the snapshot and reports the error. Raising the frame limit or chunking the snapshot is the fix if that happens.
+- Snapshots are kept in memory only. A restarted node starts empty and catches up from the leader's snapshot, because nothing is persisted to disk yet.
+
 ## Not included
 
 - **No authentication** on the HTTP API or the peer RPCs. Bind both to a trusted network only.
-- **No log compaction or snapshots.** The log grows with every write.
+- **No durable storage.** Restarting a node loses its data until it catches up from a leader. A cluster that restarts all at once loses everything.
 - **Reads are not linearizable.** A GET on a follower can return an older value.

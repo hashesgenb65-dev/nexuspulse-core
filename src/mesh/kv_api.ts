@@ -18,7 +18,7 @@
 
 import * as http from 'node:http';
 import type { LogEntry, RaftConsensusNode } from './consensus.js';
-import type { CommitApplier, KeyValueStore } from './state_machine.js';
+import type { KeyValueStore } from './state_machine.js';
 import { MAX_KEY_LENGTH } from './state_machine.js';
 
 export const KV_PATH_PREFIX = '/v1/kv/';
@@ -35,7 +35,8 @@ export interface KvPeerHttp {
 export interface KvApiOptions {
   readonly node: RaftConsensusNode;
   readonly store: KeyValueStore;
-  readonly applier: CommitApplier;
+  /** Applies committed entries to the store. Implemented by CommitApplier and StateHost. */
+  readonly applier: { applyCommitted(): number };
   /** HTTP addresses of the other members, keyed by node id. Used to redirect writes. */
   readonly peerHttp: ReadonlyMap<string, KvPeerHttp>;
   readonly commitTimeoutMs?: number;
@@ -107,7 +108,7 @@ function hostForUrl(host: string): string {
 export class KvApi {
   private readonly node: RaftConsensusNode;
   private readonly store: KeyValueStore;
-  private readonly applier: CommitApplier;
+  private readonly applier: { applyCommitted(): number };
   private readonly peerHttp: ReadonlyMap<string, KvPeerHttp>;
   private readonly commitTimeoutMs: number;
 
@@ -200,7 +201,7 @@ export class KvApi {
       await sleep(POLL_INTERVAL_MS);
     }
 
-    const stored = this.node.log[entry.index - 1];
+    const stored = this.node.entryAt(entry.index);
     if (stored === undefined || stored.term !== entry.term) {
       return failure(409, 'a later leader replaced this write before it committed; it was not applied; retry');
     }
