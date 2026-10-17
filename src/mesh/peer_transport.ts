@@ -28,6 +28,7 @@ import type {
   VoteResponse,
 } from './consensus.js';
 import type { PeerTransport, Scheduler, TimerId } from './driver.js';
+import { authenticate, PeerAuthError, refuseFrame } from './peer_auth.js';
 
 export const DEFAULT_MAX_FRAME_BYTES = 1 << 20;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 1_000;
@@ -42,7 +43,8 @@ export type TransportErrorCode =
   | 'REMOTE_ERROR'
   | 'BAD_REPLY'
   | 'UNKNOWN_PEER'
-  | 'CLOSED';
+  | 'CLOSED'
+  | 'AUTH_FAILED';
 
 /** A failure in the transport. `code` says what kind of failure it was. */
 export class TransportError extends Error {
@@ -239,6 +241,13 @@ export interface RpcHandler {
 export interface PeerServerOptions {
   handler: RpcHandler;
   maxFrameBytes?: number;
+  /**
+   * The cluster secret. When set, requests without a valid tag are dropped with their connection,
+   * and every reply is tagged. Every member must share the same secret.
+   */
+  secret?: Buffer;
+  /** Clock used for tags and the skew check. Defaults to Date.now. */
+  now?: () => number;
   /** Receives failures on connections. `where` says which part failed. */
   onError?: (error: unknown, where: string) => void;
 }
@@ -250,11 +259,15 @@ export class PeerServer {
   private readonly handler: RpcHandler;
   private readonly maxFrameBytes: number;
   private readonly onError: ((error: unknown, where: string) => void) | undefined;
+  private readonly secret: Buffer | undefined;
+  private readonly now: () => number;
 
   constructor(options: PeerServerOptions) {
     this.handler = options.handler;
     this.maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     this.onError = options.onError;
+    this.secret = options.secret;
+    this.now = options.now ?? Date.now;
     this.server = net.createServer((socket) => this.onConnection(socket));
   }
 
@@ -301,10 +314,24 @@ export class PeerServer {
         socket.destroy();
         return;
       }
-      for (const message of messages) this.dispatch(socket, message);
+      for (const message of messages) {
+        if (!this.admit(socket, message)) return;
+        this.dispatch(socket, message);
+      }
     });
     socket.on('error', (error) => this.report(error, 'socket'));
     socket.on('close', () => this.sockets.delete(socket));
+  }
+
+  /** Returns false, after dropping the connection, when a frame does not carry a valid tag. */
+  private admit(socket: net.Socket, message: unknown): boolean {
+    if (this.secret === undefined) return true;
+    const refusal = isRecord(message) ? refuseFrame(this.secret, message, this.now()) : 'not an object';
+    if (refusal === undefined) return true;
+
+    this.report(new PeerAuthError(`refused a frame: ${refusal}`), 'auth');
+    socket.destroy();
+    return false;
   }
 
   private dispatch(socket: net.Socket, message: unknown): void {
@@ -342,9 +369,10 @@ export class PeerServer {
     }
   }
 
-  private send(socket: net.Socket, frame: unknown): void {
+  private send(socket: net.Socket, frame: object): void {
     if (socket.destroyed) return;
-    socket.write(encodeFrame(frame, this.maxFrameBytes));
+    const signed = this.secret === undefined ? frame : { ...frame, auth: authenticate(this.secret, frame, this.now()) };
+    socket.write(encodeFrame(signed, this.maxFrameBytes));
   }
 
   private report(error: unknown, where: string): void {
@@ -367,12 +395,18 @@ export interface TcpPeerTransportOptions {
   requestTimeoutMs?: number;
   connectTimeoutMs?: number;
   maxFrameBytes?: number;
+  /** The cluster secret. When set, every request is tagged and every reply must carry a valid tag. */
+  secret?: Buffer;
+  /** Clock used for tags and the skew check. Defaults to Date.now. */
+  now?: () => number;
 }
 
 interface LinkSettings {
   readonly requestTimeoutMs: number;
   readonly connectTimeoutMs: number;
   readonly maxFrameBytes: number;
+  readonly secret: Buffer | undefined;
+  readonly now: () => number;
 }
 
 interface Waiter {
@@ -402,7 +436,12 @@ class Link {
     if (this.closed) throw new TransportError('CLOSED', `transport to ${this.peerId} is closed`);
     const socket = await this.connect();
     const id = this.nextId++;
-    const frame = encodeFrame({ type: 'request', id, method, body }, this.settings.maxFrameBytes);
+    const unsigned = { type: 'request', id, method, body };
+    const signed =
+      this.settings.secret === undefined
+        ? unsigned
+        : { ...unsigned, auth: authenticate(this.settings.secret, unsigned, this.settings.now()) };
+    const frame = encodeFrame(signed, this.settings.maxFrameBytes);
 
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -485,6 +524,13 @@ class Link {
   }
 
   private onMessage(socket: net.Socket, message: unknown): void {
+    if (this.settings.secret !== undefined) {
+      const refusal = isRecord(message) ? refuseFrame(this.settings.secret, message, this.settings.now()) : 'not an object';
+      if (refusal !== undefined) {
+        this.fail(socket, new TransportError('AUTH_FAILED', `${this.peerId} sent a reply that failed authentication: ${refusal}`));
+        return;
+      }
+    }
     if (!isReply(message)) {
       this.fail(socket, new TransportError('MALFORMED_FRAME', `unexpected frame from ${this.peerId}`));
       return;
@@ -522,16 +568,21 @@ export class TcpPeerTransport implements PeerTransport {
   private readonly links = new Map<string, Link>();
 
   constructor(options: TcpPeerTransportOptions) {
-    const settings: LinkSettings = {
+    const numeric = {
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
       maxFrameBytes: options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
     };
-    for (const [name, value] of Object.entries(settings)) {
+    for (const [name, value] of Object.entries(numeric)) {
       if (!Number.isInteger(value) || value <= 0) {
         throw new RangeError(`${name} must be a positive integer, got ${value}`);
       }
     }
+    const settings: LinkSettings = {
+      ...numeric,
+      secret: options.secret,
+      now: options.now ?? Date.now,
+    };
     for (const [peerId, address] of Object.entries(options.peers)) {
       this.links.set(peerId, new Link(peerId, address, settings));
     }
