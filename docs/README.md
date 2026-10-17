@@ -68,7 +68,14 @@ start if the file is readable by group or others.
 | Alert notifier | `src/alerts/notifier.ts` | `tests/alerts/test_notifier.ts` | In-process queue; at-most-once delivery |
 | Metrics export | `src/observability/prometheus.ts` | `tests/observability/test_prometheus.ts` | Prometheus text format; served at `/metrics` |
 | Worker queue | `src/queue/worker.ts` | `tests/test_worker.ts` | Dispatch on a microtask so bursts are priority-sorted |
+| Consensus | `src/mesh/consensus.ts`, `src/mesh/driver.ts` | `tests/mesh/test_election.ts`, `test_replication.ts`, `test_driver.ts`, `test_consensus.ts` | Raft election, replication and commit rules; leader barrier |
+| Mesh transport | `src/mesh/peer_transport.ts` | `tests/mesh/test_peer_transport.ts` | Length-prefixed JSON over TCP; no TLS; no peer authentication |
+| Replicated store | `src/mesh/state_machine.ts`, `src/mesh/snapshot.ts` | `tests/mesh/test_state_machine.ts`, `test_snapshots.ts`, `test_snapshot_cluster.ts`, `test_replicated_state.ts` | Key-value store; compaction and snapshot transfer |
+| Durable state | `src/mesh/durable_store.ts` | `tests/mesh/test_durable_store.ts`, `test_durable_restart.ts` | Atomic `state.json` in `dataDir`; fail-stop on write errors |
+| Node runner | `src/mesh/node_runner.ts`, `src/mesh/cli.ts`, `src/mesh/node_config.ts` | `tests/mesh/test_node_runner.ts`, `test_node_config.ts` | One member from a JSON config |
+| Key-value API | `src/mesh/kv_api.ts`, `src/mesh/status.ts` | `tests/mesh/test_kv_api.ts`, `test_status.ts` | `/v1/kv/:key` and `/v1/status`; no authentication |
 
 **Not yet built:** deployment guide; TLS and authentication for the TCP ingest
-port; Argon2; a `RouterEngine` or `TimeSeriesStorageEngine` (design not yet
+port and mesh peers; Argon2; chunked snapshot transfer (snapshots are limited to
+one 1 MiB frame); a `RouterEngine` or `TimeSeriesStorageEngine` (design not yet
 agreed).
