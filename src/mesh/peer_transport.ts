@@ -6,6 +6,10 @@
  * `{ type: 'reply', id, ok: true, body }` or `{ type: 'reply', id, ok: false, error }`. The id
  * ties each reply to its request, so replies can arrive in any order on one connection.
  *
+ * Snapshots. An InstallSnapshot is split into chunks of at most 512 KiB, sent as one
+ * `installSnapshotChunk` request each. The follower replies with the offset it wants next, so a
+ * dropped or repeated chunk is resent from the right place.
+ *
  * Server behaviour. A request whose body fails validation gets an error reply, and the
  * connection stays open. A frame that cannot be parsed, or that announces a length above the
  * limit, closes the connection, because the stream can no longer be trusted.
@@ -28,6 +32,7 @@ import type {
   VoteResponse,
 } from './consensus.js';
 import type { PeerTransport, Scheduler, TimerId } from './driver.js';
+import { SnapshotAssembler, encodeSnapshot, sliceChunk, type SnapshotChunk } from './snapshot_chunks.js';
 import { authenticate, PeerAuthError, refuseFrame } from './peer_auth.js';
 
 export const DEFAULT_MAX_FRAME_BYTES = 1 << 20;
@@ -120,7 +125,22 @@ export class FrameDecoder {
 // Validation of wire values
 // ---------------------------------------------------------------------------
 
-type Method = 'requestVote' | 'appendEntries' | 'installSnapshot';
+type Method = 'requestVote' | 'appendEntries' | 'installSnapshotChunk';
+
+/** One chunk of an InstallSnapshot, sent in its own RPC. The envelope carries the leader's term. */
+interface InstallSnapshotChunkRequest {
+  readonly term: number;
+  readonly leaderId: string;
+  readonly chunk: SnapshotChunk;
+}
+
+/** The follower's answer to one chunk. `nextOffset` is the byte the leader sends next. */
+interface InstallSnapshotChunkReply extends InstallSnapshotReply {
+  readonly nextOffset: number;
+}
+
+/** A chunk stream that makes no progress this many times in a row is abandoned. */
+const MAX_STALLED_CHUNKS = 3;
 
 interface RequestFrame {
   readonly id: number;
@@ -176,19 +196,23 @@ function isAppendRequest(value: unknown): value is AppendRequest {
   );
 }
 
-function isInstallSnapshotRequest(value: unknown): value is InstallSnapshotRequest {
-  if (!isRecord(value) || !isNonNegativeInteger(value.term) || typeof value.leaderId !== 'string') return false;
-  const { snapshot } = value;
+function isInstallSnapshotChunkRequest(value: unknown): value is InstallSnapshotChunkRequest {
   return (
-    isRecord(snapshot) &&
-    isNonNegativeInteger(snapshot.index) &&
-    isNonNegativeInteger(snapshot.term) &&
-    'data' in snapshot
+    isRecord(value) &&
+    isNonNegativeInteger(value.term) &&
+    typeof value.leaderId === 'string' &&
+    isRecord(value.chunk) &&
+    typeof value.chunk.data === 'string'
   );
 }
 
-function isInstallSnapshotReply(value: unknown): value is InstallSnapshotReply {
-  return isRecord(value) && isNonNegativeInteger(value.term) && typeof value.installed === 'boolean';
+function isInstallSnapshotChunkReply(value: unknown): value is InstallSnapshotChunkReply {
+  return (
+    isRecord(value) &&
+    isNonNegativeInteger(value.term) &&
+    typeof value.installed === 'boolean' &&
+    isNonNegativeInteger(value.nextOffset)
+  );
 }
 
 function isVoteResponse(value: unknown): value is VoteResponse {
@@ -207,8 +231,8 @@ function parseRequest(message: unknown): RequestFrame | undefined {
   if (message.method === 'appendEntries' && isAppendRequest(message.body)) {
     return { id: message.id, method: 'appendEntries', body: message.body };
   }
-  if (message.method === 'installSnapshot' && isInstallSnapshotRequest(message.body)) {
-    return { id: message.id, method: 'installSnapshot', body: message.body };
+  if (message.method === 'installSnapshotChunk' && isInstallSnapshotChunkRequest(message.body)) {
+    return { id: message.id, method: 'installSnapshotChunk', body: message.body };
   }
   return undefined;
 }
@@ -261,6 +285,8 @@ export class PeerServer {
   private readonly onError: ((error: unknown, where: string) => void) | undefined;
   private readonly secret: Buffer | undefined;
   private readonly now: () => number;
+  /** Chunks of the snapshot being received. One leader sends one snapshot at a time. */
+  private readonly snapshots = new SnapshotAssembler();
 
   constructor(options: PeerServerOptions) {
     this.handler = options.handler;
@@ -361,12 +387,28 @@ export class PeerServer {
         return this.handler.handleVoteRequest(request.body as VoteRequest);
       case 'appendEntries':
         return this.handler.handleAppendRequest(request.body as AppendRequest);
-      case 'installSnapshot': {
+      case 'installSnapshotChunk': {
         const handle = this.handler.handleSnapshotRequest;
         if (handle === undefined) throw new Error('snapshots are not supported by this node');
-        return handle.call(this.handler, request.body as InstallSnapshotRequest);
+        return this.receiveChunk(handle, request.body as InstallSnapshotChunkRequest);
       }
     }
+  }
+
+  /**
+   * Takes one chunk. A partial snapshot is only buffered, so the node's state does not change until
+   * the last chunk arrives. Then the whole snapshot goes to the handler, as before.
+   */
+  private receiveChunk(
+    handle: NonNullable<RpcHandler['handleSnapshotRequest']>,
+    body: InstallSnapshotChunkRequest,
+  ): InstallSnapshotChunkReply {
+    const result = this.snapshots.accept(body.chunk);
+    if (result.status === 'refused') throw new Error(`snapshot chunk refused: ${result.reason}`);
+    if (result.status === 'partial') return { term: body.term, installed: false, nextOffset: result.nextOffset };
+
+    const reply = handle.call(this.handler, { term: body.term, leaderId: body.leaderId, snapshot: result.snapshot });
+    return { term: reply.term, installed: reply.installed, nextOffset: body.chunk.total };
   }
 
   private send(socket: net.Socket, frame: object): void {
@@ -596,8 +638,32 @@ export class TcpPeerTransport implements PeerTransport {
     return this.call(peerId, 'appendEntries', request, isAppendReply);
   }
 
-  installSnapshot(peerId: string, request: InstallSnapshotRequest): Promise<InstallSnapshotReply> {
-    return this.call(peerId, 'installSnapshot', request, isInstallSnapshotReply);
+  /**
+   * Sends a snapshot as a series of chunk RPCs, each resuming at the offset the peer reports. Stops
+   * when the peer has the whole snapshot, or when its term no longer matches. Fails after
+   * {@link MAX_STALLED_CHUNKS} chunks in a row make no progress.
+   */
+  async installSnapshot(peerId: string, request: InstallSnapshotRequest): Promise<InstallSnapshotReply> {
+    const { snapshot } = request;
+    const bytes = encodeSnapshot(snapshot);
+    let offset = 0;
+    let stalled = 0;
+    for (;;) {
+      const chunk = sliceChunk(bytes, snapshot.term, snapshot.index, offset);
+      const body: InstallSnapshotChunkRequest = { term: request.term, leaderId: request.leaderId, chunk };
+      const reply = await this.call(peerId, 'installSnapshotChunk', body, isInstallSnapshotChunkReply);
+      if (reply.nextOffset > bytes.length) {
+        throw new TransportError('BAD_REPLY', `${peerId} asked for byte ${reply.nextOffset} of a ${bytes.length}-byte snapshot`);
+      }
+      if (reply.nextOffset >= bytes.length || reply.term !== request.term) {
+        return { term: reply.term, installed: reply.installed };
+      }
+      stalled = reply.nextOffset === offset ? stalled + 1 : 0;
+      if (stalled >= MAX_STALLED_CHUNKS) {
+        throw new TransportError('BAD_REPLY', `${peerId} stopped accepting snapshot chunks at byte ${offset}`);
+      }
+      offset = reply.nextOffset;
+    }
   }
 
   /** Closes every connection. Requests still waiting are rejected with CLOSED. */
