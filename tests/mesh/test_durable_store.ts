@@ -72,7 +72,7 @@ describe('parseDurableState', () => {
   });
 
   it('rejects a file with the wrong version or no version', () => {
-    expect(() => parseDurableState({ ...validFileBody(), version: 2 })).toThrowError(/unsupported state file version/);
+    expect(() => parseDurableState({ ...validFileBody(), version: 3 })).toThrowError(/unsupported state file version/);
     const { version: _ignored, ...withoutVersion } = validFileBody();
     expect(() => parseDurableState(withoutVersion)).toThrowError(DurableStateError);
   });
