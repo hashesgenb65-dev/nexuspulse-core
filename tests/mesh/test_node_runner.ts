@@ -52,38 +52,52 @@ async function waitFor<T>(read: () => T | undefined, timeoutMs = 5_000): Promise
   }
 }
 
+function isAddrInUse(error: unknown): boolean {
+  if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'EADDRINUSE') return true;
+  return String(error).includes('EADDRINUSE');
+}
+
+/**
+ * Starts three members. A free port is only reserved while its probe is open, so another test can
+ * take it first; on that collision, stop what started and try again with fresh ports.
+ */
 async function startThree(): Promise<MeshNodeHandle[]> {
   const ids = ['node-1', 'node-2', 'node-3'];
-  const rpc = new Map<string, number>();
-  const http = new Map<string, number>();
-  for (const id of ids) {
-    rpc.set(id, await freePort());
-    http.set(id, await freePort());
-  }
+  for (let attempt = 1; ; attempt++) {
+    const handles: MeshNodeHandle[] = [];
+    try {
+      const rpc = new Map<string, number>();
+      const http = new Map<string, number>();
+      for (const id of ids) {
+        rpc.set(id, await freePort());
+        http.set(id, await freePort());
+      }
 
-  const secretPath = writeSecret();
-  const configs: MeshNodeConfig[] = ids.map((id) =>
-    parseNodeConfig({
-      peerSecretFile: secretPath,
-      nodeId: id,
-      rpc: { host: HOST, port: rpc.get(id) },
-      http: { host: HOST, port: http.get(id) },
-      peers: ids
-        .filter((other) => other !== id)
-        .map((other) => ({ id: other, host: HOST, rpcPort: rpc.get(other), httpPort: http.get(other) })),
-      electionTimeoutMs: 150,
-      heartbeatIntervalMs: 50,
-      requestTimeoutMs: 300,
-    }),
-  );
+      const secretPath = writeSecret();
+      const configs: MeshNodeConfig[] = ids.map((id) =>
+        parseNodeConfig({
+          peerSecretFile: secretPath,
+          nodeId: id,
+          rpc: { host: HOST, port: rpc.get(id) },
+          http: { host: HOST, port: http.get(id) },
+          peers: ids
+            .filter((other) => other !== id)
+            .map((other) => ({ id: other, host: HOST, rpcPort: rpc.get(other), httpPort: http.get(other) })),
+          electionTimeoutMs: 150,
+          heartbeatIntervalMs: 50,
+          requestTimeoutMs: 300,
+        }),
+      );
 
-  const handles: MeshNodeHandle[] = [];
-  for (const config of configs) {
-    const handle = await startMeshNode(config);
-    handles.push(handle);
-    cleanups.push(() => handle.stop());
+      for (const config of configs) handles.push(await startMeshNode(config));
+    } catch (error) {
+      await Promise.all(handles.map((handle) => handle.stop()));
+      if (attempt >= 3 || !isAddrInUse(error)) throw error;
+      continue;
+    }
+    for (const handle of handles) cleanups.push(() => handle.stop());
+    return handles;
   }
-  return handles;
 }
 
 function url(handle: MeshNodeHandle, path: string): string {
