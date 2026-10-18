@@ -41,6 +41,32 @@ function freePort(): Promise<number> {
   });
 }
 
+function isAddrInUse(error: unknown): boolean {
+  if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'EADDRINUSE') return true;
+  return String(error).includes('EADDRINUSE');
+}
+
+/**
+ * Starts every member. A free port is only reserved while its probe is open, so another test can
+ * take it first; on that collision, stop what started and try again with fresh ports.
+ */
+async function startCluster(secrets: Record<string, string>): Promise<MeshNodeHandle[]> {
+  for (let attempt = 1; ; attempt++) {
+    const handles: MeshNodeHandle[] = [];
+    try {
+      for (const config of await buildConfigs(secrets)) {
+        handles.push(await startMeshNode(config));
+      }
+    } catch (error) {
+      await Promise.all(handles.map((handle) => handle.stop()));
+      if (attempt >= 3 || !isAddrInUse(error)) throw error;
+      continue;
+    }
+    for (const handle of handles) cleanups.push(() => handle.stop());
+    return handles;
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -87,13 +113,7 @@ describe('peer authentication at node level', () => {
   });
 
   it('keeps a member with the wrong secret out of the cluster, while the others elect a leader', async () => {
-    const configs = await buildConfigs({ 'node-1': 'ab', 'node-2': 'ab', 'node-3': 'cd' });
-    const handles: MeshNodeHandle[] = [];
-    for (const config of configs) {
-      const handle = await startMeshNode(config);
-      handles.push(handle);
-      cleanups.push(() => handle.stop());
-    }
+    const handles = await startCluster({ 'node-1': 'ab', 'node-2': 'ab', 'node-3': 'cd' });
     const [good1, good2, outsider] = handles;
     if (good1 === undefined || good2 === undefined || outsider === undefined) throw new Error('no handles');
 
