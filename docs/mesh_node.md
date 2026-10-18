@@ -59,10 +59,11 @@ Writes go through the leader:
 
 ## Snapshots and compaction
 
-Once a node has applied `compactThreshold` entries above its last snapshot (default 1000), it folds the store into a snapshot and drops those entries from its log. The leader keeps its latest snapshot. A peer whose next needed entry was dropped receives that snapshot in an `installSnapshot` RPC, then continues with normal replication.
+Once a node has applied `compactThreshold` entries above its last snapshot (default 1000), it folds the store into a snapshot and drops those entries from its log. The leader keeps its latest snapshot. A peer whose next needed entry was dropped receives that snapshot, sent as a series of `installSnapshotChunk` RPCs, then continues with normal replication.
 
 - The threshold is set per process with `startMeshNode(config, { compactThreshold })`. It is not part of the config file yet.
-- The snapshot must fit in one peer frame (1 MiB by default). A store with a large value set can exceed that. The leader then fails to send the snapshot and reports the error. Raising the frame limit or chunking the snapshot is the fix if that happens.
+- Snapshots are sent in chunks of at most 512 KiB, so a snapshot is not limited by the 1 MiB frame size. The follower replies with the offset it wants next, so a dropped or repeated chunk is resent from the right place. A follower that makes no progress for three chunks in a row is abandoned, and the leader reports the error.
+- A partly received snapshot is held in memory on the follower and is not written to disk. A restart discards it, and the leader starts the transfer again. A snapshot larger than 256 MiB is refused.
 - Snapshots are saved to the state file too (see Durable state below).
 
 ## Peer authentication
@@ -92,5 +93,5 @@ Because the barrier takes index 1 in a fresh cluster, the first client write is 
 
 ## Not included
 
-- **No authentication** on the HTTP API or the peer RPCs. Bind both to a trusted network only.
+- **No authentication** on the HTTP API. Bind it to a trusted network only. Peer RPCs are signed with the cluster secret, but they are not encrypted; see Peer authentication above.
 - **Reads are not linearizable.** A GET on a follower can return an older value.
