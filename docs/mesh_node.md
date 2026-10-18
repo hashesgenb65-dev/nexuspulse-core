@@ -79,7 +79,7 @@ Each frame between members carries an HMAC-SHA256 tag over its whole contents, p
 
 ## Durable state
 
-Set `dataDir` in the config to keep the node's term, vote, log and latest snapshot in `<dataDir>/state.json`. The file is rewritten atomically after every change, and always before the node answers a peer. A restarted node reads it back and rejoins the cluster with its term intact, so it cannot vote twice in one term.
+Set `dataDir` in the config to keep the node's state in that directory. The term, vote and log are in `state.json`, which is rewritten atomically after every change to them, and always before the node answers a peer. The latest snapshot is in `snapshot-<index>.json`. It is written once per snapshot index, so the frequent writes to `state.json` stay small, and older snapshot files are removed once a newer one is saved. Version 1 data directories, which kept the snapshot inside `state.json`, still load. A restarted node reads it back and rejoins the cluster with its term intact, so it cannot vote twice in one term.
 
 - Without `dataDir` the node keeps nothing across restarts and catches up from the leader instead.
 - A corrupt state file stops start-up before any port is bound. Fix or remove the file to start fresh; removing it means the node may vote again in a term it already voted in, so only do that when the rest of the cluster is healthy.
