@@ -79,21 +79,51 @@ async function buildConfigs(): Promise<MeshNodeConfig[]> {
 
 const reported: string[] = [];
 
-async function start(config: MeshNodeConfig): Promise<MeshNodeHandle> {
-  const handle = await startMeshNode(config, {
+function startOptions(config: MeshNodeConfig) {
+  return {
     compactThreshold: COMPACT_THRESHOLD,
-    onError: (error, where) => reported.push(`${config.nodeId} ${where}: ${error instanceof Error ? error.message : String(error)}`),
-  });
+    onError: (error: unknown, where: string) =>
+      reported.push(`${config.nodeId} ${where}: ${error instanceof Error ? error.message : String(error)}`),
+  };
+}
+
+async function start(config: MeshNodeConfig): Promise<MeshNodeHandle> {
+  const handle = await startMeshNode(config, startOptions(config));
   cleanups.push(() => handle.stop());
   return handle;
+}
+
+function isAddrInUse(error: unknown): boolean {
+  if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'EADDRINUSE') return true;
+  return String(error).includes('EADDRINUSE');
+}
+
+/**
+ * Starts the three members. A free port is only reserved while its probe is open, so another test can
+ * take it first; on that collision, stop what started and try again with fresh ports.
+ */
+async function startCluster(): Promise<{ configs: MeshNodeConfig[]; handles: Map<string, MeshNodeHandle> }> {
+  for (let attempt = 1; ; attempt++) {
+    const configs = await buildConfigs();
+    const started: MeshNodeHandle[] = [];
+    try {
+      for (const config of configs) started.push(await startMeshNode(config, startOptions(config)));
+    } catch (error) {
+      await Promise.all(started.map((handle) => handle.stop()));
+      if (attempt >= 3 || !isAddrInUse(error)) throw error;
+      continue;
+    }
+    for (const handle of started) cleanups.push(() => handle.stop());
+    const handles = new Map<string, MeshNodeHandle>();
+    for (const handle of started) handles.set(handle.nodeId, handle);
+    return { configs, handles };
+  }
 }
 
 describe('snapshot catch-up over real sockets', () => {
   it('brings a restarted member up to date with a snapshot once the log has been compacted past it', async () => {
     // Real timers and sockets need more than the default 5 seconds on a loaded machine.
-    const configs = await buildConfigs();
-    const handles = new Map<string, MeshNodeHandle>();
-    for (const config of configs) handles.set(config.nodeId, await start(config));
+    const { configs, handles } = await startCluster();
 
     await waitFor(() => [...handles.values()].some((h) => h.node.state === 'LEADER'));
     const leader = [...handles.values()].find((h) => h.node.state === 'LEADER');
