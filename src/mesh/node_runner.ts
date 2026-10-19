@@ -16,6 +16,7 @@ import { KeyValueStore } from './state_machine.js';
 import { DEFAULT_COMPACT_THRESHOLD, StateHost } from './snapshot.js';
 import { DurableStateFile, NodePersister, restoreNode } from './durable_store.js';
 import { loadPeerSecret, PeerAuthError } from './peer_auth.js';
+import { loadTokenFile } from '../app/token_file.js';
 
 export interface MeshNodeHandle {
   readonly nodeId: string;
@@ -73,6 +74,8 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     throw new PeerAuthError('a node with peers needs peerSecretFile, so that peer traffic is authenticated');
   }
   const secret = config.peerSecretFile === undefined ? undefined : loadPeerSecret(config.peerSecretFile);
+  // Loaded before anything is bound, so a bad token file stops start-up with no port open.
+  const tokens = config.tokensFile === undefined ? undefined : loadTokenFile(config.tokensFile);
 
   const peerAddresses: Record<string, { host: string; port: number }> = {};
   const peerHttp = new Map<string, KvPeerHttp>();
@@ -141,6 +144,7 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     commitTimeoutMs: options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS,
     persist: () => driver.persistState(),
     durable: persister !== undefined,
+    ...(tokens === undefined ? {} : { auth: tokens }),
   });
   const httpServer = createKvServer(api);
 

@@ -13,10 +13,14 @@
  * - 409 means a later leader replaced the entry before it committed, so it was not applied.
  * - 504 means the entry did not commit before the timeout. Its outcome is unknown.
  *
- * The API has no authentication. Bind it to a trusted network only.
+ * Authentication. With a token store (`auth`), GET and the status endpoint need a reader token or
+ * better, and PUT and DELETE need a writer token. Requests without a valid token get 401; a
+ * token with too few rights gets 403. Without a token store the API is open, so bind it to a
+ * trusted network in that case.
  */
 
 import * as http from 'node:http';
+import { roleSatisfies, type TokenAuth } from '../api/auth.js';
 import type { LogEntry, RaftConsensusNode } from './consensus.js';
 import type { KeyValueStore } from './state_machine.js';
 import { MAX_KEY_LENGTH } from './state_machine.js';
@@ -45,6 +49,8 @@ export interface KvApiOptions {
   readonly persist?: () => void;
   /** Whether this member writes its state to disk. Reported by GET /v1/status. */
   readonly durable?: boolean;
+  /** Token store. When set, every request needs a bearer token of the right role. */
+  readonly auth?: TokenAuth;
 }
 
 export interface KvRequest {
@@ -53,6 +59,8 @@ export interface KvRequest {
   readonly url: string;
   /** Raw body text, if any. */
   readonly body?: string;
+  /** The Authorization header, if the request sent one. */
+  readonly authorization?: string;
 }
 
 export interface KvResponse {
@@ -118,8 +126,10 @@ export class KvApi {
   private readonly commitTimeoutMs: number;
   private readonly persist: (() => void) | undefined;
   private readonly durable: boolean;
+  private readonly auth: TokenAuth | undefined;
 
   constructor(options: KvApiOptions) {
+    this.auth = options.auth;
     this.node = options.node;
     this.store = options.store;
     this.applier = options.applier;
@@ -138,7 +148,26 @@ export class KvApi {
     }
   }
 
+  /**
+   * Checks the bearer token against the role a request needs. Returns a response to send when the
+   * request must stop, or undefined when it may go on.
+   */
+  private authorize(request: KvRequest): KvResponse | undefined {
+    if (this.auth === undefined) return undefined;
+    const required = request.method === 'GET' ? 'reader' : 'writer';
+    try {
+      const principal = this.auth.authenticateHeader(request.authorization);
+      if (roleSatisfies(principal.role, required)) return undefined;
+      return failure(403, `this request needs the ${required} role`);
+    } catch {
+      return failure(401, 'missing or invalid bearer token', { 'www-authenticate': 'Bearer realm="nexuspulse"' });
+    }
+  }
+
   private async route(request: KvRequest): Promise<KvResponse> {
+    const denied = this.authorize(request);
+    if (denied !== undefined) return denied;
+
     const path = request.url.split('?')[0] ?? '';
     if (path === STATUS_PATH) {
       if (request.method !== 'GET') return failure(405, 'method not allowed', { allow: 'GET' });
@@ -254,7 +283,12 @@ export function createKvServer(api: KvApi): http.Server {
       }
       const body = chunks.length === 0 ? undefined : Buffer.concat(chunks).toString('utf8');
       api
-        .handle({ method: req.method ?? 'GET', url: req.url ?? '/', body })
+        .handle({
+          method: req.method ?? 'GET',
+          url: req.url ?? '/',
+          body,
+          ...(typeof req.headers.authorization === 'string' ? { authorization: req.headers.authorization } : {}),
+        })
         .then((response) => send(res, response))
         .catch(() => send(res, failure(500, 'internal error')));
     });

@@ -56,6 +56,8 @@ export interface MeshNodeConfig {
   readonly dataDir?: string;
   /** File holding the cluster secret (hex, at least 32 bytes, readable only by its owner). Required when there are peers. */
   readonly peerSecretFile?: string;
+  /** Token file for the key-value API. When set, every request needs a bearer token of the right role. */
+  readonly tokensFile?: string;
 }
 
 export interface ConfigIssue {
@@ -193,6 +195,12 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     else report('peerSecretFile', 'must be a non-empty string');
   }
 
+  let tokensFile: string | undefined;
+  if (raw.tokensFile !== undefined) {
+    if (typeof raw.tokensFile === 'string' && raw.tokensFile.length > 0) tokensFile = raw.tokensFile;
+    else report('tokensFile', 'must be a non-empty string');
+  }
+
   if (heartbeatIntervalMs >= electionTimeoutMs) {
     report('heartbeatIntervalMs', 'must be shorter than electionTimeoutMs');
   }
@@ -208,6 +216,7 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     requestTimeoutMs,
     ...(dataDir === undefined ? {} : { dataDir }),
     ...(peerSecretFile === undefined ? {} : { peerSecretFile }),
+    ...(tokensFile === undefined ? {} : { tokensFile }),
   };
 }
 
