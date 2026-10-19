@@ -264,6 +264,7 @@ const INGEST: IngestStats = {
   eventsAccepted: 80,
   eventsRejected: 6,
   eventsDroppedQueueFull: 2,
+  authFailures: 0,
   internalErrors: 0,
 };
 

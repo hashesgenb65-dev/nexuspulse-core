@@ -15,11 +15,17 @@
  * - Connections beyond `maxConnections` are closed at once.
  * - A connection with no socket activity for `idleTimeoutMs` is closed.
  *
- * Authentication and TLS are not handled here. Run this behind TLS or a
- * mutually authenticated tunnel before exposing it beyond a trusted network.
+ * Authentication. When a {@link TokenAuth} is configured, the first DATA frame on every
+ * connection must be an auth record: field {@link AUTH_FIELD} holds a writer token. Any other
+ * first frame, or a token that is unknown or has the reader role, closes the connection before
+ * any event is read. Without a token store the ingest is open, as before.
+ *
+ * TLS is not handled here. Run this behind TLS or a mutually authenticated tunnel before
+ * exposing it beyond a trusted network: tokens are sent in clear over plain TCP.
  */
 
 import * as net from 'node:net';
+import { roleSatisfies, type TokenAuth } from '../api/auth.js';
 import { BackpressureError, type StreamEngine, type SubmitResult, type TelemetryEvent } from '../core/engine.js';
 import {
   BinaryCodec,
@@ -74,12 +80,35 @@ export function decodeTelemetryRecord(payload: Buffer): Record<string, unknown> 
   return raw;
 }
 
+/** Field ID that carries the bearer token in the first frame of a connection. */
+export const AUTH_FIELD = 100;
+
+/** Encodes the auth record that opens an authenticated connection. */
+export function encodeAuthRecord(secret: string): Buffer {
+  return new BinaryCodec().encode({ [AUTH_FIELD]: secret });
+}
+
+/** Returns the token in an auth record, or undefined if the payload is not one. Never throws. */
+export function decodeAuthRecord(payload: Buffer): string | undefined {
+  try {
+    const value = new BinaryCodec().decode(payload)[AUTH_FIELD];
+    return typeof value === 'string' ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
 export interface TcpIngestOptions {
   readonly engine: StreamEngine;
+  /**
+   * Token store. When set, each connection must open with a writer token (see the module
+   * comment). When omitted, the ingest accepts connections without credentials.
+   */
+  readonly auth?: TokenAuth;
   /** Maximum simultaneous connections. Default 64. */
   readonly maxConnections?: number;
   /** Close a connection after this many milliseconds without socket activity. Default 60 000. */
@@ -104,6 +133,8 @@ export interface IngestStats {
   readonly eventsAccepted: number;
   readonly eventsRejected: number;
   readonly eventsDroppedQueueFull: number;
+  /** Connections closed because their opening frame was not a valid writer token. */
+  readonly authFailures: number;
   /** Unexpected engine failures. These are counted and never propagated. */
   readonly internalErrors: number;
 }
@@ -126,6 +157,7 @@ export class TcpIngestServer {
   private readonly idleTimeoutMs: number;
   private readonly transportConfig: Partial<TransportConfig>;
   private readonly submit: (raw: unknown) => SubmitResult;
+  private readonly auth: TokenAuth | undefined;
   private readonly sockets = new Set<net.Socket>();
   private readonly server: net.Server;
   private boundPort: number | undefined;
@@ -139,11 +171,13 @@ export class TcpIngestServer {
     eventsAccepted: 0,
     eventsRejected: 0,
     eventsDroppedQueueFull: 0,
+    authFailures: 0,
     internalErrors: 0,
   };
 
   constructor(options: TcpIngestOptions) {
     this.engine = options.engine;
+    this.auth = options.auth;
     this.maxConnections = options.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     assertIntegerIn('maxConnections', this.maxConnections, 1, MAX_CONNECTIONS_LIMIT);
@@ -231,15 +265,39 @@ export class TcpIngestServer {
   }
 
   private bindTransport(transport: FrameTransport, socket: net.Socket): void {
-    transport.on('frame', (frame: Frame) => this.onFrame(frame));
+    // Without a token store every connection is trusted from the start.
+    let authenticated = this.auth === undefined;
+    // A refused connection may still have frames queued behind the bad one. They are dropped, and it is counted once.
+    let refused = false;
+    transport.on('frame', (frame: Frame) => {
+      if (refused || frame.type !== FrameType.DATA) return;
+      if (!authenticated) {
+        if (!this.admit(frame.payload)) {
+          refused = true;
+          this.counters.authFailures++;
+          socket.destroy();
+          return;
+        }
+        authenticated = true;
+        return;
+      }
+      this.onFrame(frame);
+    });
     transport.on('error', () => {
       this.counters.connectionErrors++;
       socket.destroy();
     });
   }
 
+  /** True when the opening frame carries a token with the writer role. */
+  private admit(payload: Buffer): boolean {
+    const secret = decodeAuthRecord(payload);
+    if (secret === undefined || this.auth === undefined) return false;
+    const principal = this.auth.verifySecret(secret);
+    return principal !== undefined && roleSatisfies(principal.role, 'writer');
+  }
+
   private onFrame(frame: Frame): void {
-    if (frame.type !== FrameType.DATA) return;
     this.counters.framesReceived++;
 
     let raw: Record<string, unknown>;

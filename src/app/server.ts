@@ -246,6 +246,7 @@ export class NexusPulseApp {
 
       this.ingest = new TcpIngestServer({
         engine: this.engine,
+        ...(this.auth === undefined ? {} : { auth: this.auth }),
         maxConnections: s.maxConnections,
         idleTimeoutMs: s.idleTimeoutMs,
         submit: (raw: unknown) => this.submitAccepted(raw),
