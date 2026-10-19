@@ -62,7 +62,7 @@ start if the file is readable by group or others.
 | Telemetry API | `src/api/telemetry_api.ts` | `tests/api/test_telemetry_api.ts`, `tests/api/test_telemetry_auth.ts` | `/healthz` public; `/v1/*` guarded when auth is on |
 | API auth | `src/api/auth.ts` | `tests/api/test_auth.ts` | Bearer tokens, two roles; no token rotation |
 | Config manager | `src/config/manager.ts` | `tests/config/test_config.ts` | |
-| TCP ingest | `src/ingest/tcp_ingest.ts` | `tests/ingest/test_tcp_ingest.ts` | No authentication; no TLS |
+| TCP ingest | `src/ingest/tcp_ingest.ts` | `tests/ingest/test_tcp_ingest.ts` | First frame must carry a writer token; no TLS |
 | App layer | `src/app/` | `tests/app/` | Settings, server lifecycle, token file, rule evaluation over HTTP |
 | Token CLI | `src/cli/` | `tests/cli/test_token_cli.ts` | Entry point: `npm run token` |
 | Alert notifier | `src/alerts/notifier.ts` | `tests/alerts/test_notifier.ts` | In-process queue; at-most-once delivery |
@@ -73,8 +73,8 @@ start if the file is readable by group or others.
 | Replicated store | `src/mesh/state_machine.ts`, `src/mesh/snapshot.ts`, `src/mesh/snapshot_chunks.ts` | `tests/mesh/test_state_machine.ts`, `test_snapshots.ts`, `test_snapshot_chunks.ts`, `test_snapshot_transfer.ts`, `test_snapshot_cluster.ts`, `test_replicated_state.ts` | Key-value store; compaction and chunked snapshot transfer |
 | Durable state | `src/mesh/durable_store.ts` | `tests/mesh/test_durable_store.ts`, `test_durable_restart.ts` | Atomic `state.json` in `dataDir`; fail-stop on write errors |
 | Node runner | `src/mesh/node_runner.ts`, `src/mesh/cli.ts`, `src/mesh/node_config.ts` | `tests/mesh/test_node_runner.ts`, `test_node_config.ts` | One member from a JSON config |
-| Key-value API | `src/mesh/kv_api.ts`, `src/mesh/status.ts` | `tests/mesh/test_kv_api.ts`, `test_status.ts` | `/v1/kv/:key` and `/v1/status`; no authentication |
+| Key-value API | `src/mesh/kv_api.ts`, `src/mesh/status.ts` | `tests/mesh/test_kv_api.ts`, `test_kv_api_auth.ts`, `test_node_tokens.ts`, `test_status.ts` | `/v1/kv/:key` and `/v1/status`; bearer tokens when `tokensFile` is set |
 
 **Not yet built:** deployment guide; TLS for the TCP ingest port and mesh peers;
-authentication for the TCP ingest port; Argon2; a `RouterEngine` or
+Argon2; a `RouterEngine` or
 `TimeSeriesStorageEngine` (design not yet agreed).

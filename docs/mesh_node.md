@@ -75,7 +75,7 @@ Each frame between members carries an HMAC-SHA256 tag over its whole contents, p
 - Keep the members' clocks within a few seconds of each other (NTP), or valid frames will be refused as stale.
 - A captured frame can be replayed within the 30-second window. Raft tolerates this, but it is a reason to keep the window short.
 - Peer traffic is still plain TCP. The tags stop forgery and tampering, not eavesdropping. Use a private network or a tunnel until TLS is added.
-- The secret authenticates members to one another. It does not protect the HTTP API, which has no authentication.
+- The secret authenticates members to one another. It does not protect the HTTP API, which needs `tokensFile` for that.
 
 ## Durable state
 
@@ -93,5 +93,5 @@ Because the barrier takes index 1 in a fresh cluster, the first client write is 
 
 ## Not included
 
-- **No authentication** on the HTTP API. Bind it to a trusted network only. Peer RPCs are signed with the cluster secret, but they are not encrypted; see Peer authentication above.
+- **The key-value API is open unless `tokensFile` is set.** With a tokens file (the same format as the telemetry API's), reads need a reader token and writes need a writer token. Without one, bind the API to a trusted network only. Peer RPCs are signed with the cluster secret, but they are not encrypted; see Peer authentication above.
 - **Reads are not linearizable.** A GET on a follower can return an older value.
