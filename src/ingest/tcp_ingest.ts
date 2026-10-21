@@ -25,8 +25,10 @@
  */
 
 import * as net from 'node:net';
+import * as tls from 'node:tls';
 import { roleSatisfies, type TokenAuth } from '../api/auth.js';
 import { BackpressureError, type StreamEngine, type SubmitResult, type TelemetryEvent } from '../core/engine.js';
+import { tlsServerOptions, type TlsCredentials } from './tls_credentials.js';
 import {
   BinaryCodec,
   createServerTransport,
@@ -120,6 +122,11 @@ export interface TcpIngestOptions {
    * wrapper here so that rules see events that arrive over TCP.
    */
   readonly submit?: (raw: unknown) => SubmitResult;
+  /**
+   * TLS credentials. When set, the port speaks TLS (TLS 1.2 or later) and the clear-text protocol
+   * is only available inside the TLS session. Load them with `loadTlsCredentials`.
+   */
+  readonly tls?: TlsCredentials;
 }
 
 export interface IngestStats {
@@ -185,7 +192,11 @@ export class TcpIngestServer {
     this.transportConfig = { keepAliveIntervalMs: 0, ...(options.transport ?? {}) };
     const engine = this.engine;
     this.submit = options.submit ?? ((raw: unknown) => engine.submit(raw));
-    this.server = net.createServer((socket) => this.onConnection(socket));
+    const onConnection = (socket: net.Socket): void => this.onConnection(socket);
+    this.server =
+      options.tls === undefined
+        ? net.createServer(onConnection)
+        : tls.createServer(tlsServerOptions(options.tls), onConnection);
   }
 
   /**
