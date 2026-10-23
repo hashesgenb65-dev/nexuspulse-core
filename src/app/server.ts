@@ -57,6 +57,7 @@ import {
   type NotifierStats,
 } from '../alerts/notifier.js';
 import { renderNexusPulseMetrics } from '../observability/prometheus.js';
+import { EventLoopMonitor, type EventLoopLagSnapshot } from '../observability/event_loop_monitor.js';
 import { loadTokenFile } from './token_file.js';
 import type { Settings } from './settings.js';
 
@@ -105,6 +106,8 @@ export interface AppStats {
   readonly ruleReloadFailures: number;
   readonly authenticated: boolean;
   readonly alerts: NotifierStats | undefined;
+  /** Event-loop delay since the app started. Undefined before start() and after stop(). */
+  readonly eventLoop: EventLoopLagSnapshot | undefined;
 }
 
 const RULE_FILE = 'rules.npdb';
@@ -170,6 +173,7 @@ export class NexusPulseApp {
   private httpServer: Server | undefined;
   private ingest: TcpIngestServer | undefined;
   private state: AppState = 'created';
+  private readonly lagMonitor = new EventLoopMonitor();
 
   constructor(options: AppOptions) {
     this.settings = options.settings;
@@ -219,6 +223,7 @@ export class NexusPulseApp {
         this.engine.on('error', (event: EngineErrorEvent) => this.reportEngineError(event)),
       );
       this.engine.start();
+      this.lagMonitor.start();
 
       const router = createTelemetryApi({
         engine: this.engine,
@@ -317,6 +322,7 @@ export class NexusPulseApp {
       ruleReloadFailures: this.counters.ruleReloadFailures,
       authenticated: this.auth !== undefined,
       alerts: this.notifier?.stats(),
+      eventLoop: this.lagMonitor.isRunning ? this.lagMonitor.snapshot() : undefined,
     });
   }
 
@@ -358,6 +364,7 @@ export class NexusPulseApp {
 
   /** Stops listeners, drains the engine and then the notifier, then releases the store. Never throws. */
   private async teardown(): Promise<number> {
+    this.lagMonitor.stop();
     if (this.httpServer !== undefined) {
       await closeHttp(this.httpServer);
       this.httpServer = undefined;
