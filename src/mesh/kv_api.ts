@@ -21,6 +21,7 @@
 
 import * as http from 'node:http';
 import { roleSatisfies, type TokenAuth } from '../api/auth.js';
+import type { DistributedRateLimiterEngine } from '../ratelimit/limiter.js';
 import type { LogEntry, RaftConsensusNode } from './consensus.js';
 import type { KeyValueStore } from './state_machine.js';
 import { MAX_KEY_LENGTH } from './state_machine.js';
@@ -51,6 +52,12 @@ export interface KvApiOptions {
   readonly durable?: boolean;
   /** Token store. When set, every request needs a bearer token of the right role. */
   readonly auth?: TokenAuth;
+  /**
+   * Rate limiter, keyed by token name. Each request costs one token. A request over the limit gets
+   * a 429 with `retry-after`. Requires `auth`: without a token store there is no client identity, so
+   * requests are not limited.
+   */
+  readonly rateLimiter?: DistributedRateLimiterEngine;
 }
 
 export interface KvRequest {
@@ -127,9 +134,11 @@ export class KvApi {
   private readonly persist: (() => void) | undefined;
   private readonly durable: boolean;
   private readonly auth: TokenAuth | undefined;
+  private readonly rateLimiter: DistributedRateLimiterEngine | undefined;
 
   constructor(options: KvApiOptions) {
     this.auth = options.auth;
+    this.rateLimiter = options.rateLimiter;
     this.node = options.node;
     this.store = options.store;
     this.applier = options.applier;
@@ -149,24 +158,40 @@ export class KvApi {
   }
 
   /**
-   * Checks the bearer token against the role a request needs. Returns a response to send when the
-   * request must stop, or undefined when it may go on.
+   * Checks the bearer token against the role a request needs. Returns the response to send when the
+   * request must stop, or the token name to rate-limit under. The name is undefined when there is no
+   * token store.
    */
-  private authorize(request: KvRequest): KvResponse | undefined {
-    if (this.auth === undefined) return undefined;
+  private authorize(request: KvRequest): { readonly response: KvResponse } | { readonly client: string | undefined } {
+    if (this.auth === undefined) return { client: undefined };
     const required = request.method === 'GET' ? 'reader' : 'writer';
     try {
       const principal = this.auth.authenticateHeader(request.authorization);
-      if (roleSatisfies(principal.role, required)) return undefined;
-      return failure(403, `this request needs the ${required} role`);
+      if (roleSatisfies(principal.role, required)) return { client: principal.name };
+      return { response: failure(403, `this request needs the ${required} role`) };
     } catch {
-      return failure(401, 'missing or invalid bearer token', { 'www-authenticate': 'Bearer realm="nexuspulse"' });
+      return {
+        response: failure(401, 'missing or invalid bearer token', { 'www-authenticate': 'Bearer realm="nexuspulse"' }),
+      };
     }
   }
 
+  /** Takes one token from the client's bucket. Returns a 429 when the bucket is empty. */
+  private rateLimit(client: string): KvResponse | undefined {
+    if (this.rateLimiter === undefined) return undefined;
+    const result = this.rateLimiter.consume(client, 1);
+    if (result.allowed) return undefined;
+    const retryAfterSec = Math.max(1, Math.ceil(result.resetInMs / 1000));
+    return failure(429, 'rate limit exceeded', { 'retry-after': String(retryAfterSec) });
+  }
+
   private async route(request: KvRequest): Promise<KvResponse> {
-    const denied = this.authorize(request);
-    if (denied !== undefined) return denied;
+    const auth = this.authorize(request);
+    if ('response' in auth) return auth.response;
+    if (auth.client !== undefined) {
+      const limited = this.rateLimit(auth.client);
+      if (limited !== undefined) return limited;
+    }
 
     const path = request.url.split('?')[0] ?? '';
     if (path === STATUS_PATH) {
