@@ -44,15 +44,42 @@ export interface ApiKeyRecord {
 
 export interface AuthSession {
   sessionId: string;
+  /** The API key that opened this session. Revoking the key ends the session. */
+  keyId: string;
   tenantId: string;
   role: UserRole;
   permissions: ScopePermission[];
   authenticatedAt: number;
+  /** The session stops being valid at this time (epoch milliseconds). */
+  expiresAt: number;
 }
+
+export interface AuthManagerOptions {
+  /** How long a session stays valid after login. Default one hour; at most 24 hours. */
+  readonly sessionTtlMs?: number;
+  /** Clock in epoch milliseconds. Defaults to Date.now. */
+  readonly now?: () => number;
+}
+
+export const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000;
+const MAX_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 export class AuthManager {
   private apiKeys: Map<string, ApiKeyRecord> = new Map(); // keyId -> Record
   private activeSessions: Map<string, AuthSession> = new Map();
+  private readonly sessionTtlMs: number;
+  private readonly now: () => number;
+  private nextPurgeAt: number;
+
+  constructor(options: AuthManagerOptions = {}) {
+    const ttl = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
+    if (!Number.isInteger(ttl) || ttl < 1 || ttl > MAX_SESSION_TTL_MS) {
+      throw new RangeError(`sessionTtlMs must be an integer from 1 to ${MAX_SESSION_TTL_MS}`);
+    }
+    this.sessionTtlMs = ttl;
+    this.now = options.now ?? Date.now;
+    this.nextPurgeAt = this.now() + ttl;
+  }
   /** A hash that no real secret matches. Checked when a key id is unknown, so timing does not reveal which ids exist. */
   private readonly decoyHash: string = this.hashSecret(randomBytes(24).toString('hex'));
 
@@ -114,18 +141,61 @@ export class AuthManager {
       return null;
     }
 
+    const nowMs = this.now();
+    if (nowMs >= this.nextPurgeAt) this.purgeExpiredSessions();
+
     // Create session token
     const sessionId = `sess_${randomBytes(16).toString('hex')}`;
     const session: AuthSession = {
       sessionId,
+      keyId: record.keyId,
       tenantId: record.tenantId,
       role: record.role,
       permissions: record.scopes,
-      authenticatedAt: Date.now(),
+      authenticatedAt: nowMs,
+      expiresAt: nowMs + this.sessionTtlMs,
     };
 
     this.activeSessions.set(sessionId, session);
     return session;
+  }
+
+  /**
+   * Returns the session if it exists and has not expired. An expired session is removed on the
+   * first check after it expires.
+   */
+  public validateSession(sessionId: string): AuthSession | null {
+    const session = this.activeSessions.get(sessionId);
+    if (session === undefined) return null;
+    if (this.now() >= session.expiresAt) {
+      this.activeSessions.delete(sessionId);
+      return null;
+    }
+    return session;
+  }
+
+  /** Ends one session. Returns false if it did not exist. */
+  public revokeSession(sessionId: string): boolean {
+    return this.activeSessions.delete(sessionId);
+  }
+
+  /** Removes every expired session and returns how many were removed. */
+  public purgeExpiredSessions(): number {
+    const nowMs = this.now();
+    let removed = 0;
+    for (const [sessionId, session] of this.activeSessions) {
+      if (nowMs >= session.expiresAt) {
+        this.activeSessions.delete(sessionId);
+        removed++;
+      }
+    }
+    this.nextPurgeAt = nowMs + this.sessionTtlMs;
+    return removed;
+  }
+
+  /** Number of sessions held in memory, expired ones included until they are purged. */
+  public get sessionCount(): number {
+    return this.activeSessions.size;
   }
 
   /**
@@ -155,6 +225,9 @@ export class AuthManager {
     if (!record) return false;
 
     record.isActive = false;
+    for (const [sessionId, session] of this.activeSessions) {
+      if (session.keyId === keyId) this.activeSessions.delete(sessionId);
+    }
     return true;
   }
 
