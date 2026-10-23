@@ -17,6 +17,7 @@ import { DEFAULT_COMPACT_THRESHOLD, StateHost } from './snapshot.js';
 import { DurableStateFile, NodePersister, restoreNode } from './durable_store.js';
 import { loadPeerSecret, PeerAuthError } from './peer_auth.js';
 import { loadTokenFile } from '../app/token_file.js';
+import { openDurableAudit } from '../audit/durable_audit.js';
 
 export interface MeshNodeHandle {
   readonly nodeId: string;
@@ -76,6 +77,8 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
   const secret = config.peerSecretFile === undefined ? undefined : loadPeerSecret(config.peerSecretFile);
   // Loaded before anything is bound, so a bad token file stops start-up with no port open.
   const tokens = config.tokensFile === undefined ? undefined : loadTokenFile(config.tokensFile);
+  // Opened and verified before anything is bound, so a broken audit file stops start-up with no port open.
+  const audit = config.auditFile === undefined ? undefined : openDurableAudit(config.auditFile);
 
   const peerAddresses: Record<string, { host: string; port: number }> = {};
   const peerHttp = new Map<string, KvPeerHttp>();
@@ -145,17 +148,20 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     persist: () => driver.persistState(),
     durable: persister !== undefined,
     ...(tokens === undefined ? {} : { auth: tokens }),
+    ...(audit === undefined ? {} : { audit: audit.ledger }),
   });
   const httpServer = createKvServer(api);
 
   // If a later listener fails, close what is already open before reporting the error.
   const rpcPort = await rpcServer.listen(config.rpc.port, config.rpc.host).catch((error: unknown) => {
     transport.close();
+    audit?.close();
     throw error;
   });
   const httpPort = await listenHttp(httpServer, config.http.port, config.http.host).catch(async (error: unknown) => {
     await rpcServer.close();
     transport.close();
+    audit?.close();
     throw error;
   });
 
@@ -168,6 +174,7 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
       transport.close();
       await rpcServer.close();
       await closeHttp(httpServer);
+      audit?.close();
     })();
     return stopping;
   };

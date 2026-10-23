@@ -58,6 +58,11 @@ export interface MeshNodeConfig {
   readonly peerSecretFile?: string;
   /** Token file for the key-value API. When set, every request needs a bearer token of the right role. */
   readonly tokensFile?: string;
+  /**
+   * File that stores committed key-value writes in the audit ledger, one JSON line per record. The
+   * file is verified when the node starts. Each member records the writes it served.
+   */
+  readonly auditFile?: string;
 }
 
 export interface ConfigIssue {
@@ -201,6 +206,12 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     else report('tokensFile', 'must be a non-empty string');
   }
 
+  let auditFile: string | undefined;
+  if (raw.auditFile !== undefined) {
+    if (typeof raw.auditFile === 'string' && raw.auditFile.length > 0) auditFile = raw.auditFile;
+    else report('auditFile', 'must be a non-empty string');
+  }
+
   if (heartbeatIntervalMs >= electionTimeoutMs) {
     report('heartbeatIntervalMs', 'must be shorter than electionTimeoutMs');
   }
@@ -217,6 +228,7 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     ...(dataDir === undefined ? {} : { dataDir }),
     ...(peerSecretFile === undefined ? {} : { peerSecretFile }),
     ...(tokensFile === undefined ? {} : { tokensFile }),
+    ...(auditFile === undefined ? {} : { auditFile }),
   };
 }
 
