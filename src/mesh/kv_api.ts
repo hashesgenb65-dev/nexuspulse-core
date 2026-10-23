@@ -29,6 +29,12 @@ import { MAX_KEY_LENGTH } from './state_machine.js';
 import { nodeStatus, STATUS_PATH } from './status.js';
 
 export const KV_PATH_PREFIX = '/v1/kv/';
+/** Lists audit records. Needs the audit ledger and a reader token. */
+export const AUDIT_PATH = '/v1/audit';
+/** Checks the audit chain's hashes. Needs the audit ledger and a reader token. */
+export const AUDIT_VERIFY_PATH = '/v1/audit/verify';
+export const DEFAULT_AUDIT_LIMIT = 100;
+export const MAX_AUDIT_LIMIT = 1_000;
 export const MAX_KV_BODY_BYTES = 64 * 1024;
 export const DEFAULT_COMMIT_TIMEOUT_MS = 2_000;
 const POLL_INTERVAL_MS = 5;
@@ -202,6 +208,10 @@ export class KvApi {
     }
 
     const path = request.url.split('?')[0] ?? '';
+    if (path === AUDIT_PATH || path === AUDIT_VERIFY_PATH) {
+      if (request.method !== 'GET') return failure(405, 'method not allowed', { allow: 'GET' });
+      return this.audited(path, request.url);
+    }
     if (path === STATUS_PATH) {
       if (request.method !== 'GET') return failure(405, 'method not allowed', { allow: 'GET' });
       return json(200, nodeStatus(this.node, this.store, this.durable));
@@ -246,6 +256,43 @@ export class KvApi {
     const body = response.body as { index?: number; term?: number };
     if (typeof body.index !== 'number' || typeof body.term !== 'number') return;
     this.audit.append(actor, action, `kv:${key}`, { index: body.index, term: body.term, ...extra });
+  }
+
+  /** Answers the audit endpoints. Read-only, and only when a ledger is configured. */
+  private audited(path: string, url: string): KvResponse {
+    if (this.audit === undefined) return failure(404, 'not found');
+    if (path === AUDIT_VERIFY_PATH) {
+      return json(200, this.audit.verifyIntegrity());
+    }
+    return this.listAudit(url);
+  }
+
+  private listAudit(url: string): KvResponse {
+    const audit = this.audit;
+    if (audit === undefined) return failure(404, 'not found');
+    const params = new URLSearchParams(url.split('?')[1] ?? '');
+
+    const filter: { actorId?: string; action?: string; startTime?: number; endTime?: number } = {};
+    const actorId = params.get('actor');
+    if (actorId !== null) filter.actorId = actorId;
+    const action = params.get('action');
+    if (action !== null) filter.action = action;
+    for (const [name, target] of [['since', 'startTime'], ['until', 'endTime']] as const) {
+      const raw = params.get(name);
+      if (raw === null) continue;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return failure(400, `${name} must be a number of epoch milliseconds`);
+      filter[target] = value;
+    }
+
+    const limitRaw = params.get('limit');
+    const limit = limitRaw === null ? DEFAULT_AUDIT_LIMIT : Number(limitRaw);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUDIT_LIMIT) {
+      return failure(400, `limit must be an integer from 1 to ${MAX_AUDIT_LIMIT}`);
+    }
+
+    const matches = audit.query(filter);
+    return json(200, { total: matches.length, records: matches.slice(0, limit) });
   }
 
   private read(key: string): KvResponse {
