@@ -29,6 +29,7 @@ import * as tls from 'node:tls';
 import { roleSatisfies, type TokenAuth } from '../api/auth.js';
 import { BackpressureError, type StreamEngine, type SubmitResult, type TelemetryEvent } from '../core/engine.js';
 import { tlsServerOptions, type TlsCredentials } from './tls_credentials.js';
+import type { DistributedRateLimiterEngine } from '../ratelimit/limiter.js';
 import {
   BinaryCodec,
   createServerTransport,
@@ -127,6 +128,12 @@ export interface TcpIngestOptions {
    * is only available inside the TLS session. Load them with `loadTlsCredentials`.
    */
   readonly tls?: TlsCredentials;
+  /**
+   * Rate limiter, keyed by the token name that opened the connection. Each event costs one token.
+   * Events over the limit are dropped and counted in `eventsRateLimited`. Requires `auth`: without a
+   * token store there is no identity to limit by.
+   */
+  readonly rateLimiter?: DistributedRateLimiterEngine;
 }
 
 export interface IngestStats {
@@ -144,6 +151,8 @@ export interface IngestStats {
   readonly authFailures: number;
   /** Unexpected engine failures. These are counted and never propagated. */
   readonly internalErrors: number;
+  /** Events dropped because their connection's token was over its rate limit. */
+  readonly eventsRateLimited: number;
 }
 
 export const DEFAULT_MAX_CONNECTIONS = 64;
@@ -165,6 +174,7 @@ export class TcpIngestServer {
   private readonly transportConfig: Partial<TransportConfig>;
   private readonly submit: (raw: unknown) => SubmitResult;
   private readonly auth: TokenAuth | undefined;
+  private readonly rateLimiter: DistributedRateLimiterEngine | undefined;
   private readonly sockets = new Set<net.Socket>();
   private readonly server: net.Server;
   private boundPort: number | undefined;
@@ -180,11 +190,13 @@ export class TcpIngestServer {
     eventsDroppedQueueFull: 0,
     authFailures: 0,
     internalErrors: 0,
+    eventsRateLimited: 0,
   };
 
   constructor(options: TcpIngestOptions) {
     this.engine = options.engine;
     this.auth = options.auth;
+    this.rateLimiter = options.rateLimiter;
     this.maxConnections = options.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     assertIntegerIn('maxConnections', this.maxConnections, 1, MAX_CONNECTIONS_LIMIT);
@@ -278,12 +290,15 @@ export class TcpIngestServer {
   private bindTransport(transport: FrameTransport, socket: net.Socket): void {
     // Without a token store every connection is trusted from the start.
     let authenticated = this.auth === undefined;
+    // The token name that opened this connection. Undefined when there is no token store.
+    let client: string | undefined;
     // A refused connection may still have frames queued behind the bad one. They are dropped, and it is counted once.
     let refused = false;
     transport.on('frame', (frame: Frame) => {
       if (refused || frame.type !== FrameType.DATA) return;
       if (!authenticated) {
-        if (!this.admit(frame.payload)) {
+        client = this.admit(frame.payload);
+        if (client === undefined) {
           refused = true;
           this.counters.authFailures++;
           socket.destroy();
@@ -292,7 +307,7 @@ export class TcpIngestServer {
         authenticated = true;
         return;
       }
-      this.onFrame(frame);
+      this.onFrame(frame, client);
     });
     transport.on('error', () => {
       this.counters.connectionErrors++;
@@ -300,16 +315,22 @@ export class TcpIngestServer {
     });
   }
 
-  /** True when the opening frame carries a token with the writer role. */
-  private admit(payload: Buffer): boolean {
+  /** Returns the token name when the opening frame carries a writer token, otherwise undefined. */
+  private admit(payload: Buffer): string | undefined {
     const secret = decodeAuthRecord(payload);
-    if (secret === undefined || this.auth === undefined) return false;
+    if (secret === undefined || this.auth === undefined) return undefined;
     const principal = this.auth.verifySecret(secret);
-    return principal !== undefined && roleSatisfies(principal.role, 'writer');
+    if (principal === undefined || !roleSatisfies(principal.role, 'writer')) return undefined;
+    return principal.name;
   }
 
-  private onFrame(frame: Frame): void {
+  private onFrame(frame: Frame, client: string | undefined): void {
     this.counters.framesReceived++;
+
+    if (this.rateLimiter !== undefined && client !== undefined && !this.rateLimiter.consume(client, 1).allowed) {
+      this.counters.eventsRateLimited++;
+      return;
+    }
 
     let raw: Record<string, unknown>;
     try {
