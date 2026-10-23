@@ -22,6 +22,7 @@
 import * as http from 'node:http';
 import { roleSatisfies, type TokenAuth } from '../api/auth.js';
 import type { DistributedRateLimiterEngine } from '../ratelimit/limiter.js';
+import type { AuditLedgerEngine } from '../audit/ledger.js';
 import type { LogEntry, RaftConsensusNode } from './consensus.js';
 import type { KeyValueStore } from './state_machine.js';
 import { MAX_KEY_LENGTH } from './state_machine.js';
@@ -58,6 +59,11 @@ export interface KvApiOptions {
    * requests are not limited.
    */
   readonly rateLimiter?: DistributedRateLimiterEngine;
+  /**
+   * Audit ledger. Every committed write is appended with the token name that made it, the key, the
+   * Raft index and term, and the size of the value. Values themselves are not recorded.
+   */
+  readonly audit?: AuditLedgerEngine;
 }
 
 export interface KvRequest {
@@ -135,10 +141,12 @@ export class KvApi {
   private readonly durable: boolean;
   private readonly auth: TokenAuth | undefined;
   private readonly rateLimiter: DistributedRateLimiterEngine | undefined;
+  private readonly audit: AuditLedgerEngine | undefined;
 
   constructor(options: KvApiOptions) {
     this.auth = options.auth;
     this.rateLimiter = options.rateLimiter;
+    this.audit = options.audit;
     this.node = options.node;
     this.store = options.store;
     this.applier = options.applier;
@@ -203,6 +211,8 @@ export class KvApi {
     const key = keyFromPath(path);
     if (key === undefined) return failure(400, `key must be 1 to ${MAX_KEY_LENGTH} characters after URL decoding`);
 
+    const actor = 'client' in auth && auth.client !== undefined ? auth.client : 'unauthenticated';
+
     switch (request.method) {
       case 'GET':
         return this.read(key);
@@ -210,13 +220,32 @@ export class KvApi {
         const parsed = parsePutBody(request.body);
         if (!parsed.ok) return failure(400, parsed.reason);
         // submit() proposes before its first await, so the proposal is made within this call.
-        return this.submit(path, () => this.node.proposeCommand('SET', { key, value: parsed.value }));
+        const response = await this.submit(path, () => this.node.proposeCommand('SET', { key, value: parsed.value }));
+        this.recordWrite(actor, 'SET', key, response, { valueBytes: Buffer.byteLength(JSON.stringify(parsed.value)) });
+        return response;
       }
-      case 'DELETE':
-        return this.submit(path, () => this.node.proposeCommand('DELETE', { key }));
+      case 'DELETE': {
+        const response = await this.submit(path, () => this.node.proposeCommand('DELETE', { key }));
+        this.recordWrite(actor, 'DELETE', key, response, {});
+        return response;
+      }
       default:
         return failure(405, 'method not allowed', { allow: 'GET, PUT, DELETE' });
     }
+  }
+
+  /** Appends a committed write to the audit ledger. Only a 200 response counts as committed. */
+  private recordWrite(
+    actor: string,
+    action: 'SET' | 'DELETE',
+    key: string,
+    response: KvResponse,
+    extra: Record<string, number>,
+  ): void {
+    if (this.audit === undefined || response.status !== 200) return;
+    const body = response.body as { index?: number; term?: number };
+    if (typeof body.index !== 'number' || typeof body.term !== 'number') return;
+    this.audit.append(actor, action, `kv:${key}`, { index: body.index, term: body.term, ...extra });
   }
 
   private read(key: string): KvResponse {
