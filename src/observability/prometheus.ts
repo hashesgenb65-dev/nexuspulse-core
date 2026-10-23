@@ -209,6 +209,8 @@ export interface MetricsInput {
   readonly findings?: number | undefined;
   readonly ruleReloads?: number | undefined;
   readonly ruleReloadFailures?: number | undefined;
+  /** Event-loop delay figures, when a monitor is running. */
+  readonly eventLoop?: { readonly samples: number; readonly p50Ms: number; readonly p99Ms: number; readonly maxMs: number } | undefined;
 }
 
 /** Converts NexusPulse statistics into metric families. */
@@ -273,6 +275,29 @@ export function nexusPulseFamilies(input: MetricsInput): MetricFamily[] {
       help: 'Rule reloads rejected because a stored rule was invalid.',
       samples: [{ value: input.ruleReloadFailures }],
     });
+  }
+  if (input.eventLoop !== undefined) {
+    const lag = input.eventLoop;
+    families.push(
+      {
+        name: 'nexuspulse_event_loop_lag_p99_ms',
+        type: 'gauge',
+        help: '99th percentile event-loop delay in milliseconds.',
+        samples: [{ value: lag.p99Ms }],
+      },
+      {
+        name: 'nexuspulse_event_loop_lag_max_ms',
+        type: 'gauge',
+        help: 'Largest event-loop delay in milliseconds since the last reset.',
+        samples: [{ value: lag.maxMs }],
+      },
+      {
+        name: 'nexuspulse_event_loop_samples_total',
+        type: 'counter',
+        help: 'Event-loop delay samples taken.',
+        samples: [{ value: lag.samples }],
+      },
+    );
   }
   return families;
 }
