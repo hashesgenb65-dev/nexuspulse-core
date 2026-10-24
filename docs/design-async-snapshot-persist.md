@@ -69,9 +69,22 @@ can reload after restart, and the file is then missing, so the node falls back t
 
 ## Open problems to decide before coding
 
-- **The image copy is still synchronous (item 1).** `store.image()` must be measured. If it is large
-  enough to matter, the copy itself needs to be batched, or the store must be iterated lazily.
-  This is a separate measurement step, not something the deferred trim fixes.
+- **The image copy is the largest blocker, and the deferred trim does not fix it.** Measured on this
+  workspace (Node 22, 100-byte values, median of 3 runs; scripts are outside the repo):
+
+  | Entries | `store.image()` deep copy | `JSON.stringify` of the image | Shallow copy of map references |
+  |---|---|---|---|
+  | 10,000 | 16.8 ms | 19 ms | not measured |
+  | 100,000 | 178.7 ms | 306 ms | 16.4 ms |
+  | 1,000,000 | 2,420 ms | 3,808 ms | 210.5 ms |
+
+  At 1M entries the deep copy alone is longer than the default 1,000 ms election timeout. The
+  serialized image is about 129 MB.
+
+  `apply` replaces a stored value (`structuredClone` on write) rather than mutating it, so a copy
+  of the map's references is a stable point-in-time view. Serializing from those references later is
+  safe, and `image()` can stop deep-copying on the loop. The remaining reference copy is still
+  synchronous, at 210 ms for 1M entries, so it should be batched or measured again at real sizes.
 - **Log growth while a write is pending.** Under a slow disk the log grows until the write finishes.
   A bound is needed, either a maximum pending time or a rule that defers a second compaction until
   the first finishes.
@@ -92,11 +105,19 @@ can reload after restart, and the file is then missing, so the node falls back t
 
 ## Recommendation
 
-Build the deferred trim in three commits, each with its tests:
+Build it in four commits, each with its tests:
 
-1. Background snapshot writer used by `StateHost`, with the image copy measured and reported.
+0. Replace the deep copy in `store.image()` with a copy of map references, and keep the
+   serialization from those references. Add a test that a value applied after the copy is not in
+   the copy. This is the largest single improvement (2.4 s to 210 ms at 1M entries).
+1. Background snapshot writer used by `StateHost`, writing in batches with yields.
 2. Pending-compaction state and the trim commit, with the crash-state tests.
 3. Cluster test for a follower catching up during a pending compaction.
 
-Decisions needed from you: the maximum time a compaction may stay pending, and whether the image
-copy should be batched in this stage or measured first.
+Decisions still needed from you:
+
+- **Maximum time a compaction may stay pending.** Proposed default: 10 seconds, after which the
+  node logs a warning and keeps the log whole. It stays configurable.
+- **Batching the reference copy (stage 0).** At 1M entries it still takes 210 ms on the loop, so
+  either batch it or accept that cost for now. I suggest accepting it for stage 0 and measuring
+  again at real sizes before stage 1.
