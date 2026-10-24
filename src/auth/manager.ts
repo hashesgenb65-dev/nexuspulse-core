@@ -6,6 +6,7 @@
  */
 
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
+import type { AuthStateStore } from './auth_state_store.js';
 
 /**
  * Parameters for hashing API key secrets with scrypt. Each key gets its own random salt, and the
@@ -59,6 +60,8 @@ export interface AuthManagerOptions {
   readonly sessionTtlMs?: number;
   /** Clock in epoch milliseconds. Defaults to Date.now. */
   readonly now?: () => number;
+  /** Where API keys and sessions are kept so they survive a restart. Without one, they live in memory only. */
+  readonly stateStore?: AuthStateStore;
 }
 
 export const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000;
@@ -69,6 +72,7 @@ export class AuthManager {
   private activeSessions: Map<string, AuthSession> = new Map();
   private readonly sessionTtlMs: number;
   private readonly now: () => number;
+  private readonly stateStore: AuthStateStore | undefined;
   private nextPurgeAt: number;
 
   constructor(options: AuthManagerOptions = {}) {
@@ -79,6 +83,13 @@ export class AuthManager {
     this.sessionTtlMs = ttl;
     this.now = options.now ?? Date.now;
     this.nextPurgeAt = this.now() + ttl;
+    this.stateStore = options.stateStore;
+    const saved = this.stateStore?.load();
+    for (const key of saved?.apiKeys ?? []) this.apiKeys.set(key.keyId, key);
+    const startedAt = this.now();
+    for (const session of saved?.sessions ?? []) {
+      if (startedAt < session.expiresAt) this.activeSessions.set(session.sessionId, session);
+    }
   }
   /** A hash that no real secret matches. Checked when a key id is unknown, so timing does not reveal which ids exist. */
   private readonly decoyHash: string = this.hashSecret(randomBytes(24).toString('hex'));
@@ -114,6 +125,13 @@ export class AuthManager {
     };
 
     this.apiKeys.set(keyId, record);
+    try {
+      this.persist();
+    } catch (error) {
+      // A key that could not be saved is not issued, so it cannot disappear on restart after use.
+      this.apiKeys.delete(keyId);
+      throw error;
+    }
 
     return { keyId, secretKey, rawApiKey };
   }
@@ -157,6 +175,13 @@ export class AuthManager {
     };
 
     this.activeSessions.set(sessionId, session);
+    try {
+      this.persist();
+    } catch (error) {
+      // A session that could not be saved is not issued, so a login never depends on a write that failed.
+      this.activeSessions.delete(sessionId);
+      throw error;
+    }
     return session;
   }
 
@@ -167,8 +192,12 @@ export class AuthManager {
   public validateSession(sessionId: string): AuthSession | null {
     const session = this.activeSessions.get(sessionId);
     if (session === undefined) return null;
-    if (this.now() >= session.expiresAt) {
+    // A session is valid only while its API key exists and is active. Keys are not persisted, so
+    // sessions restored after a restart are refused until their key is created again.
+    const key = this.apiKeys.get(session.keyId);
+    if (this.now() >= session.expiresAt || key === undefined || !key.isActive) {
       this.activeSessions.delete(sessionId);
+      this.persistBestEffort();
       return null;
     }
     return session;
@@ -176,7 +205,9 @@ export class AuthManager {
 
   /** Ends one session. Returns false if it did not exist. */
   public revokeSession(sessionId: string): boolean {
-    return this.activeSessions.delete(sessionId);
+    const existed = this.activeSessions.delete(sessionId);
+    if (existed) this.persist();
+    return existed;
   }
 
   /** Removes every expired session and returns how many were removed. */
@@ -190,7 +221,30 @@ export class AuthManager {
       }
     }
     this.nextPurgeAt = nowMs + this.sessionTtlMs;
+    if (removed > 0) this.persistBestEffort();
     return removed;
+  }
+
+  /**
+   * Writes the current sessions to the store, if one is configured. Errors propagate.
+   */
+  private persist(): void {
+    this.stateStore?.save({
+      apiKeys: [...this.apiKeys.values()],
+      sessions: [...this.activeSessions.values()],
+    });
+  }
+
+  /**
+   * Writes removals of sessions that are already invalid. A failed write is ignored: an expired or
+   * orphaned session is refused on every check and dropped on the next successful save or load.
+   */
+  private persistBestEffort(): void {
+    try {
+      this.persist();
+    } catch {
+      // Ignored on purpose; see above.
+    }
   }
 
   /** Number of sessions held in memory, expired ones included until they are purged. */
@@ -228,6 +282,7 @@ export class AuthManager {
     for (const [sessionId, session] of this.activeSessions) {
       if (session.keyId === keyId) this.activeSessions.delete(sessionId);
     }
+    this.persist();
     return true;
   }
 
