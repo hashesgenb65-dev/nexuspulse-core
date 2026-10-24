@@ -31,7 +31,7 @@ import {
 import { RecordStore, StorageCorruptionError, StorageRecordTooLargeError, StorageValidationError } from '../db/record_store.js';
 import { defineSchema, validate, type Schema } from '../db/schema.js';
 import { ApiError, Router, type ErrorHook, type Handler, type Method, type RequestContext, type ApiResponse } from './http_router.js';
-import type { Role, TokenAuth } from './auth.js';
+import type { Role, Authenticator } from './auth.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -60,7 +60,7 @@ export interface TelemetryApiOptions {
    * When set, `/v1/*` routes require a bearer token: readers may call GET
    * routes, writers may also call POST, PUT and DELETE. `/healthz` stays public.
    */
-  readonly auth?: TokenAuth;
+  readonly auth?: Authenticator;
   /**
    * Submits one raw event. Defaults to `engine.submit`. The host passes a
    * wrapper here so that rules see events that arrive over HTTP.

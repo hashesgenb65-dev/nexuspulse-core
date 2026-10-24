@@ -16,6 +16,7 @@
 
 import * as fs from 'node:fs';
 import { generateSecret, TokenAuth, validateTokenSpecs, type Role, type TokenSpec } from '../api/auth.js';
+import { RotatingTokenAuth, type RotationOptions, type RotationReport } from '../api/token_rotation.js';
 
 export const MAX_TOKEN_FILE_BYTES = 64 * 1024;
 
@@ -53,6 +54,38 @@ export interface LoadTokenFileOptions {
  * @throws {TokenFileError} With a `reason` describing what failed.
  */
 export function loadTokenFile(file: string, options: LoadTokenFileOptions = {}): TokenAuth {
+  return new TokenAuth(readTokenSpecs(file, options));
+}
+
+/** Loads a token file into an authenticator that can be rotated with {@link reloadTokenFile}. */
+export function loadRotatingTokenFile(
+  file: string,
+  options: LoadTokenFileOptions & RotationOptions = {},
+): RotatingTokenAuth {
+  return new RotatingTokenAuth(readTokenSpecs(file, options), options);
+}
+
+/**
+ * Re-reads a token file and swaps its tokens into `auth`. A file that fails any check throws, and the
+ * tokens that were in use stay in place.
+ *
+ * @throws {TokenFileError} If the file cannot be used.
+ * @throws {AuthConfigError} If the tokens fail validation.
+ */
+export function reloadTokenFile(
+  auth: RotatingTokenAuth,
+  file: string,
+  options: LoadTokenFileOptions = {},
+): RotationReport {
+  return auth.reload(readTokenSpecs(file, options));
+}
+
+/**
+ * Reads and validates a token file, returning its specs. Every check in {@link loadTokenFile} applies.
+ *
+ * @throws {TokenFileError} With a `reason` describing what failed.
+ */
+export function readTokenSpecs(file: string, options: LoadTokenFileOptions = {}): TokenSpec[] {
   let stat: fs.Stats;
   try {
     stat = fs.statSync(file);
@@ -90,7 +123,7 @@ export function loadTokenFile(file: string, options: LoadTokenFileOptions = {}):
     const lines = issues.map((i) => `${i.token}: ${i.message}`);
     throw new TokenFileError('invalid-tokens', `token file ${file} is invalid: ${lines.join('; ')}`, lines);
   }
-  return new TokenAuth(parsed as TokenSpec[]);
+  return parsed as TokenSpec[];
 }
 
 /** Creates a token spec with a freshly generated secret. */

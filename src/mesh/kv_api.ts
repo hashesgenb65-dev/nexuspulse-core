@@ -20,7 +20,7 @@
  */
 
 import * as http from 'node:http';
-import { roleSatisfies, type TokenAuth } from '../api/auth.js';
+import { roleSatisfies, type Authenticator } from '../api/auth.js';
 import type { DistributedRateLimiterEngine } from '../ratelimit/limiter.js';
 import type { AuditLedgerEngine } from '../audit/ledger.js';
 import type { LogEntry, RaftConsensusNode } from './consensus.js';
@@ -58,7 +58,7 @@ export interface KvApiOptions {
   /** Whether this member writes its state to disk. Reported by GET /v1/status. */
   readonly durable?: boolean;
   /** Token store. When set, every request needs a bearer token of the right role. */
-  readonly auth?: TokenAuth;
+  readonly auth?: Authenticator;
   /**
    * Rate limiter, keyed by token name. Each request costs one token. A request over the limit gets
    * a 429 with `retry-after`. Requires `auth`: without a token store there is no client identity, so
@@ -145,7 +145,7 @@ export class KvApi {
   private readonly commitTimeoutMs: number;
   private readonly persist: (() => void) | undefined;
   private readonly durable: boolean;
-  private readonly auth: TokenAuth | undefined;
+  private readonly auth: Authenticator | undefined;
   private readonly rateLimiter: DistributedRateLimiterEngine | undefined;
   private readonly audit: AuditLedgerEngine | undefined;
 

@@ -15,7 +15,7 @@
  * - Connections beyond `maxConnections` are closed at once.
  * - A connection with no socket activity for `idleTimeoutMs` is closed.
  *
- * Authentication. When a {@link TokenAuth} is configured, the first DATA frame on every
+ * Authentication. When a {@link Authenticator} is configured, the first DATA frame on every
  * connection must be an auth record: field {@link AUTH_FIELD} holds a writer token. Any other
  * first frame, or a token that is unknown or has the reader role, closes the connection before
  * any event is read. Without a token store the ingest is open, as before.
@@ -26,7 +26,7 @@
 
 import * as net from 'node:net';
 import * as tls from 'node:tls';
-import { roleSatisfies, type TokenAuth } from '../api/auth.js';
+import { roleSatisfies, type Authenticator } from '../api/auth.js';
 import { BackpressureError, type StreamEngine, type SubmitResult, type TelemetryEvent } from '../core/engine.js';
 import { tlsServerOptions, type TlsCredentials } from './tls_credentials.js';
 import type { DistributedRateLimiterEngine } from '../ratelimit/limiter.js';
@@ -111,7 +111,7 @@ export interface TcpIngestOptions {
    * Token store. When set, each connection must open with a writer token (see the module
    * comment). When omitted, the ingest accepts connections without credentials.
    */
-  readonly auth?: TokenAuth;
+  readonly auth?: Authenticator;
   /** Maximum simultaneous connections. Default 64. */
   readonly maxConnections?: number;
   /** Close a connection after this many milliseconds without socket activity. Default 60 000. */
@@ -173,7 +173,7 @@ export class TcpIngestServer {
   private readonly idleTimeoutMs: number;
   private readonly transportConfig: Partial<TransportConfig>;
   private readonly submit: (raw: unknown) => SubmitResult;
-  private readonly auth: TokenAuth | undefined;
+  private readonly auth: Authenticator | undefined;
   private readonly rateLimiter: DistributedRateLimiterEngine | undefined;
   private readonly sockets = new Set<net.Socket>();
   private readonly server: net.Server;
