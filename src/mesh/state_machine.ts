@@ -144,6 +144,18 @@ export class KeyValueStore {
   }
 
   /**
+   * Like {@link KeyValueStore.image}, but the values are shared with the store instead of copied,
+   * so it is much cheaper for a large store. It is safe because {@link KeyValueStore.apply} replaces
+   * a stored value and never changes one in place. The result is for serializing only: changing it
+   * changes the store. Use {@link KeyValueStore.image} for anything a caller may change.
+   */
+  referenceImage(): StoreImage {
+    const data: Record<string, unknown> = {};
+    for (const [key, value] of this.data) data[key] = value;
+    return { lastApplied: this.applied, data, rejected: [...this.rejectedEntries] };
+  }
+
+  /**
    * Replaces the whole store with an image made by {@link KeyValueStore.image}. Values are copied
    * in, so the image can be reused. Every check runs before any change is made.
    *
