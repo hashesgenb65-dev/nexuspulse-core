@@ -165,13 +165,55 @@ export function principalOf(ctx: RequestContext): Principal | undefined {
 // Authenticator
 // ---------------------------------------------------------------------------
 
+/** What the API, telemetry and ingest layers need from an authenticator. Implemented by TokenAuth and RotatingTokenAuth. */
+export interface Authenticator {
+  readonly size: number;
+  describe(): readonly { readonly name: string; readonly role: Role }[];
+  verifySecret(secret: string): Principal | undefined;
+  authenticateHeader(header: string | undefined): Principal;
+  guard(minimum: Role, handler: Handler): Handler;
+}
+
+/** Authenticates an Authorization header with the given verifier. Shared so every authenticator gives the same 401s. */
+export function authenticateWith(
+  verify: (secret: string) => Principal | undefined,
+  header: string | undefined,
+): Principal {
+  const secret = parseBearer(header);
+  if (secret === undefined) {
+    throw unauthorized(header === undefined ? 'missing bearer token' : 'malformed authorization header');
+  }
+  const principal = verify(secret);
+  if (principal === undefined) throw unauthorized('invalid token');
+  return principal;
+}
+
+/** Wraps a handler with an authenticator and a minimum role check. Shared so every authenticator gives the same 403s. */
+export function guardWith(
+  authenticate: (header: string | undefined) => Principal,
+  minimum: Role,
+  handler: Handler,
+): Handler {
+  return (ctx: RequestContext): ApiResponse | void | Promise<ApiResponse | void> => {
+    const principal = authenticate(headerOf(ctx.req));
+    if (ROLE_RANK[principal.role] < ROLE_RANK[minimum]) {
+      throw new ApiError(403, 'FORBIDDEN', `this route requires the ${minimum} role`, {
+        role: principal.role,
+        required: minimum,
+      });
+    }
+    principals.set(ctx.req, principal);
+    return handler(ctx);
+  };
+}
+
 interface Entry {
   readonly name: string;
   readonly role: Role;
   readonly digest: Buffer;
 }
 
-export class TokenAuth {
+export class TokenAuth implements Authenticator {
   private readonly entries: readonly Entry[];
 
   /**
@@ -216,13 +258,7 @@ export class TokenAuth {
    *   missing, malformed, or does not match any token.
    */
   authenticateHeader(header: string | undefined): Principal {
-    const secret = parseBearer(header);
-    if (secret === undefined) {
-      throw unauthorized(header === undefined ? 'missing bearer token' : 'malformed authorization header');
-    }
-    const principal = this.verifySecret(secret);
-    if (principal === undefined) throw unauthorized('invalid token');
-    return principal;
+    return authenticateWith((secret) => this.verifySecret(secret), header);
   }
 
   /**
@@ -231,17 +267,7 @@ export class TokenAuth {
    * @throws {ApiError} 401 for missing or invalid credentials, 403 for insufficient role.
    */
   guard(minimum: Role, handler: Handler): Handler {
-    return (ctx: RequestContext): ApiResponse | void | Promise<ApiResponse | void> => {
-      const principal = this.authenticateHeader(headerOf(ctx.req));
-      if (ROLE_RANK[principal.role] < ROLE_RANK[minimum]) {
-        throw new ApiError(403, 'FORBIDDEN', `this route requires the ${minimum} role`, {
-          role: principal.role,
-          required: minimum,
-        });
-      }
-      principals.set(ctx.req, principal);
-      return handler(ctx);
-    };
+    return guardWith((header) => this.authenticateHeader(header), minimum, handler);
   }
 }
 

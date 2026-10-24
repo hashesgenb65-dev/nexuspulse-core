@@ -22,6 +22,8 @@
  */
 
 import * as net from 'node:net';
+import * as tls from 'node:tls';
+import { tlsServerOptions, type TlsCredentials, MIN_TLS_VERSION } from '../ingest/tls_credentials.js';
 import type {
   AppendReply,
   AppendRequest,
@@ -274,6 +276,8 @@ export interface PeerServerOptions {
   now?: () => number;
   /** Receives failures on connections. `where` says which part failed. */
   onError?: (error: unknown, where: string) => void;
+  /** TLS credentials. When set, peers must connect over TLS 1.2 or later. */
+  tls?: TlsCredentials;
 }
 
 /** Accepts peer connections and answers their RPCs by calling the handler. */
@@ -294,7 +298,11 @@ export class PeerServer {
     this.onError = options.onError;
     this.secret = options.secret;
     this.now = options.now ?? Date.now;
-    this.server = net.createServer((socket) => this.onConnection(socket));
+    const onConnection = (socket: net.Socket): void => this.onConnection(socket);
+    this.server =
+      options.tls === undefined
+        ? net.createServer(onConnection)
+        : tls.createServer(tlsServerOptions(options.tls), onConnection);
   }
 
   /** Starts listening. Port 0 picks a free port. Resolves with the port in use. */
@@ -441,6 +449,16 @@ export interface TcpPeerTransportOptions {
   secret?: Buffer;
   /** Clock used for tags and the skew check. Defaults to Date.now. */
   now?: () => number;
+  /** When set, connections use TLS and the peer's certificate must chain to `ca`. */
+  tls?: PeerTlsClient;
+}
+
+/** How a peer connection trusts the other member's certificate. */
+export interface PeerTlsClient {
+  /** PEM certificate, or chain, that the peer's certificate must chain to. */
+  readonly ca: Buffer;
+  /** Name checked against the certificate. Defaults to the peer's host. */
+  readonly servername?: string;
 }
 
 interface LinkSettings {
@@ -449,6 +467,7 @@ interface LinkSettings {
   readonly maxFrameBytes: number;
   readonly secret: Buffer | undefined;
   readonly now: () => number;
+  readonly tls: PeerTlsClient | undefined;
 }
 
 interface Waiter {
@@ -522,12 +541,23 @@ class Link {
         fail(new TransportError('UNREACHABLE', `cannot reach ${this.peerId}: ${error.message}`));
       };
 
-      const socket = net.connect({ host: this.address.host, port: this.address.port });
+      const tlsClient = this.settings.tls;
+      const socket: net.Socket =
+        tlsClient === undefined
+          ? net.connect({ host: this.address.host, port: this.address.port })
+          : tls.connect({
+              host: this.address.host,
+              port: this.address.port,
+              ca: tlsClient.ca,
+              ...(tlsClient.servername === undefined ? {} : { servername: tlsClient.servername }),
+              minVersion: MIN_TLS_VERSION,
+              rejectUnauthorized: true,
+            });
       timer = setTimeout(() => {
         fail(new TransportError('UNREACHABLE', `connecting to ${this.peerId} timed out`));
       }, this.settings.connectTimeoutMs);
       socket.once('error', onConnectError);
-      socket.once('connect', () => {
+      socket.once(tlsClient === undefined ? 'connect' : 'secureConnect', () => {
         socket.removeListener('error', onConnectError);
         if (timer !== undefined) clearTimeout(timer);
         this.connecting = undefined;
@@ -624,6 +654,7 @@ export class TcpPeerTransport implements PeerTransport {
       ...numeric,
       secret: options.secret,
       now: options.now ?? Date.now,
+      tls: options.tls,
     };
     for (const [peerId, address] of Object.entries(options.peers)) {
       this.links.set(peerId, new Link(peerId, address, settings));
