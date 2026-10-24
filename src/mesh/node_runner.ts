@@ -110,6 +110,17 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     node,
     store,
     compactThreshold: options.compactThreshold ?? DEFAULT_COMPACT_THRESHOLD,
+    // With a data directory, the snapshot is written in the background and the log is trimmed afterwards.
+    ...(config.dataDir === undefined ? {} : { snapshotDirectory: config.dataDir }),
+    onSnapshotCommitted: () => {
+      // The trimmed log must reach disk too. A failed save has already stopped the driver, and is reported there.
+      try {
+        driver.persistState();
+      } catch {
+        // Reported and handled by the driver.
+      }
+    },
+    onError: options.onError,
   });
   // Restore what was saved before the driver starts. A corrupt file stops start-up here, before any port is bound.
   const durableFile = config.dataDir === undefined ? undefined : new DurableStateFile(config.dataDir);
@@ -188,6 +199,7 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       if (tokens !== undefined) process.off('SIGHUP', onReload);
+      host.dispose();
       driver.stop();
       transport.close();
       await rpcServer.close();
