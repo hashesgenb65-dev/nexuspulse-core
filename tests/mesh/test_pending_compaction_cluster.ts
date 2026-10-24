@@ -20,8 +20,8 @@ import { startMeshNode, type MeshNodeHandle } from '../../src/mesh/node_runner';
 
 const HOST = '127.0.0.1';
 const COMPACT_THRESHOLD = 5;
-// 20 values of 16 KiB keep one AppendEntries frame under the 1 MiB peer frame limit.
-const VALUE_BYTES = 16 * 1024;
+// 20 values of 64 KiB: about 1.3 MB in total, more than one peer frame can carry.
+const VALUE_BYTES = 64 * 1024;
 const cleanups: Array<() => Promise<void>> = [];
 const dirs: string[] = [];
 const reported: string[] = [];

@@ -28,6 +28,13 @@
  * Not implemented here: election and heartbeat timers, the network transport, and durable storage.
  */
 
+/**
+ * Largest total size, in bytes of JSON, of the entries in one AppendEntries request. It is well under the
+ * 1 MiB peer frame limit, so a long uncompacted log tail is sent in several requests rather than one that
+ * cannot be delivered. A single entry larger than this is still sent alone.
+ */
+export const MAX_APPEND_ENTRY_BYTES = 512 * 1024;
+
 export type NodeState = 'FOLLOWER' | 'CANDIDATE' | 'LEADER';
 
 export interface LogEntry {
@@ -325,9 +332,27 @@ export class RaftConsensusNode {
       leaderId: this.nodeId,
       prevLogIndex,
       prevLogTerm: this.termAt(prevLogIndex) ?? 0,
-      entries: this.log.slice(prevLogIndex - this.snapshotIndex),
+      entries: this.entriesAfter(prevLogIndex),
       leaderCommit: this.commitIndex,
     };
+  }
+
+  /**
+   * The entries after `prevLogIndex`, up to {@link MAX_APPEND_ENTRY_BYTES} of JSON. The first entry is
+   * always included, so a leader can still make progress. The rest follow in later requests, because a
+   * successful reply moves matchIndex by the number of entries it acknowledges.
+   */
+  private entriesAfter(prevLogIndex: number): LogEntry[] {
+    const out: LogEntry[] = [];
+    let bytes = 0;
+    for (let i = prevLogIndex - this.snapshotIndex; i < this.log.length; i++) {
+      const entry = this.log[i]!;
+      const size = Buffer.byteLength(JSON.stringify(entry), 'utf8');
+      if (out.length > 0 && bytes + size > MAX_APPEND_ENTRY_BYTES) break;
+      out.push(entry);
+      bytes += size;
+    }
+    return out;
   }
 
   /**
