@@ -26,6 +26,9 @@ import type { AuthManager } from '../auth/manager.js';
 import { LoginFailureLimiter } from '../auth/login_limiter.js';
 import { AuthStateError } from '../auth/auth_state_store.js';
 
+/** Failed logins allowed per client address inside the login window. */
+export const DEFAULT_MAX_ADDRESS_LOGIN_FAILURES = 20;
+
 /** Reads `{ "apiKey": "..." }`. Returns undefined for any other shape, or a key that is empty or too long. */
 function parseLoginBody(body: string | undefined): string | undefined {
   if (body === undefined) return undefined;
@@ -95,6 +98,12 @@ export interface KvApiOptions {
    */
   readonly loginLimiter?: LoginFailureLimiter;
   /**
+   * Limits failed logins per client address, across all key ids, so one client cannot try many key ids.
+   * Defaults to 20 failures per 15 minutes. Requests with no address are not limited by this. Behind a
+   * proxy every client shares the proxy's address, so the limit is shared too.
+   */
+  readonly addressLoginLimiter?: LoginFailureLimiter;
+  /**
    * Audit ledger. Every committed write is appended with the token name that made it, the key, the
    * Raft index and term, and the size of the value. Values themselves are not recorded.
    */
@@ -109,6 +118,8 @@ export interface KvRequest {
   readonly body?: string;
   /** The Authorization header, if the request sent one. */
   readonly authorization?: string;
+  /** The client's address, as the socket reports it. Used to limit failed logins per client. */
+  readonly remoteAddress?: string;
 }
 
 export interface KvResponse {
@@ -179,11 +190,13 @@ export class KvApi {
   private readonly audit: AuditLedgerEngine | undefined;
   private readonly sessions: AuthManager | undefined;
   private readonly loginLimiter: LoginFailureLimiter;
+  private readonly addressLoginLimiter: LoginFailureLimiter;
 
   constructor(options: KvApiOptions) {
     this.auth = options.auth;
     this.sessions = options.sessions;
     this.loginLimiter = options.loginLimiter ?? new LoginFailureLimiter();
+    this.addressLoginLimiter = options.addressLoginLimiter ?? new LoginFailureLimiter({ maxFailures: DEFAULT_MAX_ADDRESS_LOGIN_FAILURES });
     this.rateLimiter = options.rateLimiter;
     this.audit = options.audit;
     this.node = options.node;
@@ -220,7 +233,9 @@ export class KvApi {
     if (apiKey === undefined) return failure(400, 'body must be JSON with an apiKey string of 1 to 512 characters');
     // The key id is the part before the first dot. A blocked key id is refused before its secret is checked.
     const keyId = apiKey.split('.')[0] ?? apiKey;
-    const gate = this.loginLimiter.check(keyId);
+    const address = request.remoteAddress;
+    const addressGate = address === undefined ? { allowed: true as const } : this.addressLoginLimiter.check(address);
+    const gate = addressGate.allowed ? this.loginLimiter.check(keyId) : addressGate;
     if (!gate.allowed) {
       this.recordLogin(keyId, 'LOGIN_BLOCKED');
       const retryAfterSec = Math.max(1, Math.ceil(gate.retryAfterMs / 1000));
@@ -236,6 +251,7 @@ export class KvApi {
     }
     if (session === null) {
       this.loginLimiter.recordFailure(keyId);
+      if (address !== undefined) this.addressLoginLimiter.recordFailure(address);
       this.recordLogin(keyId, 'LOGIN_FAILED');
       return failure(401, 'invalid API key', { 'www-authenticate': 'Bearer realm="nexuspulse"' });
     }
@@ -466,6 +482,7 @@ export function createKvServer(api: KvApi): http.Server {
           url: req.url ?? '/',
           body,
           ...(typeof req.headers.authorization === 'string' ? { authorization: req.headers.authorization } : {}),
+          ...(req.socket.remoteAddress === undefined ? {} : { remoteAddress: req.socket.remoteAddress }),
         })
         .then((response) => send(res, response))
         .catch(() => send(res, failure(500, 'internal error')));
