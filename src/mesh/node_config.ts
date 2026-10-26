@@ -63,6 +63,12 @@ export interface MeshNodeConfig {
    * file is verified when the node starts. Each member records the writes it served.
    */
   readonly auditFile?: string;
+  /**
+   * File that stores API keys and login sessions, so both survive a restart. When set, clients can
+   * exchange an API key for a session at POST /v1/sessions. The file is owner-only and is checked
+   * when the node starts. The node keeps its own copy of the keys: create keys while it is stopped.
+   */
+  readonly authStateFile?: string;
 }
 
 export interface ConfigIssue {
@@ -212,6 +218,12 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     else report('auditFile', 'must be a non-empty string');
   }
 
+  let authStateFile: string | undefined;
+  if (raw.authStateFile !== undefined) {
+    if (typeof raw.authStateFile === 'string' && raw.authStateFile.length > 0) authStateFile = raw.authStateFile;
+    else report('authStateFile', 'must be a non-empty string');
+  }
+
   if (heartbeatIntervalMs >= electionTimeoutMs) {
     report('heartbeatIntervalMs', 'must be shorter than electionTimeoutMs');
   }
@@ -229,6 +241,7 @@ export function parseNodeConfig(raw: unknown): MeshNodeConfig {
     ...(peerSecretFile === undefined ? {} : { peerSecretFile }),
     ...(tokensFile === undefined ? {} : { tokensFile }),
     ...(auditFile === undefined ? {} : { auditFile }),
+    ...(authStateFile === undefined ? {} : { authStateFile }),
   };
 }
 

@@ -18,6 +18,10 @@ import { DurableStateFile, NodePersister, restoreNode } from './durable_store.js
 import { loadPeerSecret, PeerAuthError } from './peer_auth.js';
 import { loadRotatingTokenFile, reloadTokenFile } from '../app/token_file.js';
 import { openDurableAudit } from '../audit/durable_audit.js';
+import { AuthManager } from '../auth/manager.js';
+import { FileAuthStateStore } from '../auth/auth_state_store.js';
+import type { Authenticator } from '../api/auth.js';
+import { SessionAuthenticator } from '../api/session_auth.js';
 
 export interface MeshNodeHandle {
   readonly nodeId: string;
@@ -83,8 +87,16 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     tokenFile === undefined
       ? undefined
       : loadRotatingTokenFile(tokenFile, options.tokenGraceMs === undefined ? {} : { graceMs: options.tokenGraceMs });
+  // Keys and sessions, loaded before the audit file is opened, so a broken state file stops start-up with
+  // no port open and no file held open.
+  const sessions =
+    config.authStateFile === undefined
+      ? undefined
+      : new AuthManager({ stateStore: new FileAuthStateStore(config.authStateFile) });
   // Opened and verified before anything is bound, so a broken audit file stops start-up with no port open.
   const audit = config.auditFile === undefined ? undefined : openDurableAudit(config.auditFile);
+  const auth: Authenticator | undefined =
+    sessions === undefined ? tokens : new SessionAuthenticator(tokens, sessions);
 
   const peerAddresses: Record<string, { host: string; port: number }> = {};
   const peerHttp = new Map<string, KvPeerHttp>();
@@ -164,7 +176,8 @@ export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNo
     commitTimeoutMs: options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS,
     persist: () => driver.persistState(),
     durable: persister !== undefined,
-    ...(tokens === undefined ? {} : { auth: tokens }),
+    ...(auth === undefined ? {} : { auth }),
+    ...(sessions === undefined ? {} : { sessions }),
     ...(audit === undefined ? {} : { audit: audit.ledger }),
   });
   const httpServer = createKvServer(api);
