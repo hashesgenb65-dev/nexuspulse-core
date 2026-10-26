@@ -20,13 +20,21 @@
  */
 
 import * as http from 'node:http';
-import { roleSatisfies, type TokenAuth } from '../api/auth.js';
+import { roleSatisfies, type Authenticator } from '../api/auth.js';
+import type { DistributedRateLimiterEngine } from '../ratelimit/limiter.js';
+import type { AuditLedgerEngine } from '../audit/ledger.js';
 import type { LogEntry, RaftConsensusNode } from './consensus.js';
 import type { KeyValueStore } from './state_machine.js';
 import { MAX_KEY_LENGTH } from './state_machine.js';
 import { nodeStatus, STATUS_PATH } from './status.js';
 
 export const KV_PATH_PREFIX = '/v1/kv/';
+/** Lists audit records. Needs the audit ledger and a reader token. */
+export const AUDIT_PATH = '/v1/audit';
+/** Checks the audit chain's hashes. Needs the audit ledger and a reader token. */
+export const AUDIT_VERIFY_PATH = '/v1/audit/verify';
+export const DEFAULT_AUDIT_LIMIT = 100;
+export const MAX_AUDIT_LIMIT = 1_000;
 export const MAX_KV_BODY_BYTES = 64 * 1024;
 export const DEFAULT_COMMIT_TIMEOUT_MS = 2_000;
 const POLL_INTERVAL_MS = 5;
@@ -50,7 +58,18 @@ export interface KvApiOptions {
   /** Whether this member writes its state to disk. Reported by GET /v1/status. */
   readonly durable?: boolean;
   /** Token store. When set, every request needs a bearer token of the right role. */
-  readonly auth?: TokenAuth;
+  readonly auth?: Authenticator;
+  /**
+   * Rate limiter, keyed by token name. Each request costs one token. A request over the limit gets
+   * a 429 with `retry-after`. Requires `auth`: without a token store there is no client identity, so
+   * requests are not limited.
+   */
+  readonly rateLimiter?: DistributedRateLimiterEngine;
+  /**
+   * Audit ledger. Every committed write is appended with the token name that made it, the key, the
+   * Raft index and term, and the size of the value. Values themselves are not recorded.
+   */
+  readonly audit?: AuditLedgerEngine;
 }
 
 export interface KvRequest {
@@ -126,10 +145,14 @@ export class KvApi {
   private readonly commitTimeoutMs: number;
   private readonly persist: (() => void) | undefined;
   private readonly durable: boolean;
-  private readonly auth: TokenAuth | undefined;
+  private readonly auth: Authenticator | undefined;
+  private readonly rateLimiter: DistributedRateLimiterEngine | undefined;
+  private readonly audit: AuditLedgerEngine | undefined;
 
   constructor(options: KvApiOptions) {
     this.auth = options.auth;
+    this.rateLimiter = options.rateLimiter;
+    this.audit = options.audit;
     this.node = options.node;
     this.store = options.store;
     this.applier = options.applier;
@@ -149,26 +172,46 @@ export class KvApi {
   }
 
   /**
-   * Checks the bearer token against the role a request needs. Returns a response to send when the
-   * request must stop, or undefined when it may go on.
+   * Checks the bearer token against the role a request needs. Returns the response to send when the
+   * request must stop, or the token name to rate-limit under. The name is undefined when there is no
+   * token store.
    */
-  private authorize(request: KvRequest): KvResponse | undefined {
-    if (this.auth === undefined) return undefined;
+  private authorize(request: KvRequest): { readonly response: KvResponse } | { readonly client: string | undefined } {
+    if (this.auth === undefined) return { client: undefined };
     const required = request.method === 'GET' ? 'reader' : 'writer';
     try {
       const principal = this.auth.authenticateHeader(request.authorization);
-      if (roleSatisfies(principal.role, required)) return undefined;
-      return failure(403, `this request needs the ${required} role`);
+      if (roleSatisfies(principal.role, required)) return { client: principal.name };
+      return { response: failure(403, `this request needs the ${required} role`) };
     } catch {
-      return failure(401, 'missing or invalid bearer token', { 'www-authenticate': 'Bearer realm="nexuspulse"' });
+      return {
+        response: failure(401, 'missing or invalid bearer token', { 'www-authenticate': 'Bearer realm="nexuspulse"' }),
+      };
     }
   }
 
+  /** Takes one token from the client's bucket. Returns a 429 when the bucket is empty. */
+  private rateLimit(client: string): KvResponse | undefined {
+    if (this.rateLimiter === undefined) return undefined;
+    const result = this.rateLimiter.consume(client, 1);
+    if (result.allowed) return undefined;
+    const retryAfterSec = Math.max(1, Math.ceil(result.resetInMs / 1000));
+    return failure(429, 'rate limit exceeded', { 'retry-after': String(retryAfterSec) });
+  }
+
   private async route(request: KvRequest): Promise<KvResponse> {
-    const denied = this.authorize(request);
-    if (denied !== undefined) return denied;
+    const auth = this.authorize(request);
+    if ('response' in auth) return auth.response;
+    if (auth.client !== undefined) {
+      const limited = this.rateLimit(auth.client);
+      if (limited !== undefined) return limited;
+    }
 
     const path = request.url.split('?')[0] ?? '';
+    if (path === AUDIT_PATH || path === AUDIT_VERIFY_PATH) {
+      if (request.method !== 'GET') return failure(405, 'method not allowed', { allow: 'GET' });
+      return this.audited(path, request.url);
+    }
     if (path === STATUS_PATH) {
       if (request.method !== 'GET') return failure(405, 'method not allowed', { allow: 'GET' });
       return json(200, nodeStatus(this.node, this.store, this.durable));
@@ -178,6 +221,8 @@ export class KvApi {
     const key = keyFromPath(path);
     if (key === undefined) return failure(400, `key must be 1 to ${MAX_KEY_LENGTH} characters after URL decoding`);
 
+    const actor = 'client' in auth && auth.client !== undefined ? auth.client : 'unauthenticated';
+
     switch (request.method) {
       case 'GET':
         return this.read(key);
@@ -185,13 +230,69 @@ export class KvApi {
         const parsed = parsePutBody(request.body);
         if (!parsed.ok) return failure(400, parsed.reason);
         // submit() proposes before its first await, so the proposal is made within this call.
-        return this.submit(path, () => this.node.proposeCommand('SET', { key, value: parsed.value }));
+        const response = await this.submit(path, () => this.node.proposeCommand('SET', { key, value: parsed.value }));
+        this.recordWrite(actor, 'SET', key, response, { valueBytes: Buffer.byteLength(JSON.stringify(parsed.value)) });
+        return response;
       }
-      case 'DELETE':
-        return this.submit(path, () => this.node.proposeCommand('DELETE', { key }));
+      case 'DELETE': {
+        const response = await this.submit(path, () => this.node.proposeCommand('DELETE', { key }));
+        this.recordWrite(actor, 'DELETE', key, response, {});
+        return response;
+      }
       default:
         return failure(405, 'method not allowed', { allow: 'GET, PUT, DELETE' });
     }
+  }
+
+  /** Appends a committed write to the audit ledger. Only a 200 response counts as committed. */
+  private recordWrite(
+    actor: string,
+    action: 'SET' | 'DELETE',
+    key: string,
+    response: KvResponse,
+    extra: Record<string, number>,
+  ): void {
+    if (this.audit === undefined || response.status !== 200) return;
+    const body = response.body as { index?: number; term?: number };
+    if (typeof body.index !== 'number' || typeof body.term !== 'number') return;
+    this.audit.append(actor, action, `kv:${key}`, { index: body.index, term: body.term, ...extra });
+  }
+
+  /** Answers the audit endpoints. Read-only, and only when a ledger is configured. */
+  private audited(path: string, url: string): KvResponse {
+    if (this.audit === undefined) return failure(404, 'not found');
+    if (path === AUDIT_VERIFY_PATH) {
+      return json(200, this.audit.verifyIntegrity());
+    }
+    return this.listAudit(url);
+  }
+
+  private listAudit(url: string): KvResponse {
+    const audit = this.audit;
+    if (audit === undefined) return failure(404, 'not found');
+    const params = new URLSearchParams(url.split('?')[1] ?? '');
+
+    const filter: { actorId?: string; action?: string; startTime?: number; endTime?: number } = {};
+    const actorId = params.get('actor');
+    if (actorId !== null) filter.actorId = actorId;
+    const action = params.get('action');
+    if (action !== null) filter.action = action;
+    for (const [name, target] of [['since', 'startTime'], ['until', 'endTime']] as const) {
+      const raw = params.get(name);
+      if (raw === null) continue;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return failure(400, `${name} must be a number of epoch milliseconds`);
+      filter[target] = value;
+    }
+
+    const limitRaw = params.get('limit');
+    const limit = limitRaw === null ? DEFAULT_AUDIT_LIMIT : Number(limitRaw);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUDIT_LIMIT) {
+      return failure(400, `limit must be an integer from 1 to ${MAX_AUDIT_LIMIT}`);
+    }
+
+    const matches = audit.query(filter);
+    return json(200, { total: matches.length, records: matches.slice(0, limit) });
   }
 
   private read(key: string): KvResponse {
