@@ -113,7 +113,8 @@ export class StateHost {
     const term = this.node.termAt(applied);
     if (term === undefined) return;
 
-    this.latest = { index: applied, term, data: this.store.image() };
+    // Shares the store's values: the snapshot is only serialized, and apply never changes a stored value in place.
+    this.latest = { index: applied, term, data: this.store.referenceImage() };
     this.node.compactTo(applied);
   }
 }
