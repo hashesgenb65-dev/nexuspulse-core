@@ -18,6 +18,7 @@ import { DurableStateFile, NodePersister, restoreNode } from './durable_store.js
 import { loadPeerSecret, PeerAuthError } from './peer_auth.js';
 import { loadRotatingTokenFile, reloadTokenFile } from '../app/token_file.js';
 import { openDurableAudit } from '../audit/durable_audit.js';
+import { acquireStateLock } from '../auth/state_lock.js';
 import { AuthManager } from '../auth/manager.js';
 import { FileAuthStateStore } from '../auth/auth_state_store.js';
 import type { Authenticator } from '../api/auth.js';
@@ -76,6 +77,28 @@ function closeHttp(server: http.Server): Promise<void> {
  * @throws {Error} If either listener cannot bind, for example because the port is in use.
  */
 export async function startMeshNode(config: MeshNodeConfig, options: StartMeshNodeOptions = {}): Promise<MeshNodeHandle> {
+  // While the member runs it holds the auth state file's lock, so the key command cannot write to the
+  // file underneath it. The lock is released if start-up fails, and when the member stops.
+  const releaseLock = config.authStateFile === undefined ? undefined : acquireStateLock(config.authStateFile);
+  let handle: MeshNodeHandle;
+  try {
+    handle = await startMember(config, options);
+  } catch (error) {
+    releaseLock?.();
+    throw error;
+  }
+  if (releaseLock === undefined) return handle;
+  const stopMember = handle.stop;
+  return {
+    ...handle,
+    stop: async (): Promise<void> => {
+      await stopMember();
+      releaseLock();
+    },
+  };
+}
+
+async function startMember(config: MeshNodeConfig, options: StartMeshNodeOptions): Promise<MeshNodeHandle> {
   // A cluster member must authenticate its peers. Check this before anything is bound or written.
   if (config.peers.length > 0 && config.peerSecretFile === undefined) {
     throw new PeerAuthError('a node with peers needs peerSecretFile, so that peer traffic is authenticated');

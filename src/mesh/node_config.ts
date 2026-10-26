@@ -66,7 +66,8 @@ export interface MeshNodeConfig {
   /**
    * File that stores API keys and login sessions, so both survive a restart. When set, clients can
    * exchange an API key for a session at POST /v1/sessions. The file is owner-only and is checked
-   * when the node starts. The node keeps its own copy of the keys: create keys while it is stopped.
+   * when the node starts. While the node runs it holds the file's lock, so keys are created with the
+   * apikey command, which refuses to write until the node has stopped.
    */
   readonly authStateFile?: string;
 }
