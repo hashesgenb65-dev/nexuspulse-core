@@ -21,6 +21,23 @@
 
 import * as http from 'node:http';
 import { roleSatisfies, type Authenticator } from '../api/auth.js';
+import { SESSION_LOGIN_PATH } from '../api/session_auth.js';
+import type { AuthManager } from '../auth/manager.js';
+
+/** Reads `{ "apiKey": "..." }`. Returns undefined for any other shape, or a key that is empty or too long. */
+function parseLoginBody(body: string | undefined): string | undefined {
+  if (body === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+  const apiKey = (parsed as { apiKey?: unknown }).apiKey;
+  if (typeof apiKey !== 'string' || apiKey.length === 0 || apiKey.length > 512) return undefined;
+  return apiKey;
+}
 import type { DistributedRateLimiterEngine } from '../ratelimit/limiter.js';
 import type { AuditLedgerEngine } from '../audit/ledger.js';
 import type { LogEntry, RaftConsensusNode } from './consensus.js';
@@ -65,6 +82,11 @@ export interface KvApiOptions {
    * requests are not limited.
    */
   readonly rateLimiter?: DistributedRateLimiterEngine;
+  /**
+   * Session store. When set, POST /v1/sessions exchanges an API key for a session id. Use it together
+   * with an authenticator that accepts sessions, such as SessionAuthenticator.
+   */
+  readonly sessions?: AuthManager;
   /**
    * Audit ledger. Every committed write is appended with the token name that made it, the key, the
    * Raft index and term, and the size of the value. Values themselves are not recorded.
@@ -148,9 +170,11 @@ export class KvApi {
   private readonly auth: Authenticator | undefined;
   private readonly rateLimiter: DistributedRateLimiterEngine | undefined;
   private readonly audit: AuditLedgerEngine | undefined;
+  private readonly sessions: AuthManager | undefined;
 
   constructor(options: KvApiOptions) {
     this.auth = options.auth;
+    this.sessions = options.sessions;
     this.rateLimiter = options.rateLimiter;
     this.audit = options.audit;
     this.node = options.node;
@@ -176,6 +200,22 @@ export class KvApi {
    * request must stop, or the token name to rate-limit under. The name is undefined when there is no
    * token store.
    */
+  /**
+   * Exchanges an API key for a session id, which is then sent as the bearer token. The key is never
+   * stored in the reply, and the reply is not cached.
+   */
+  private login(request: KvRequest): KvResponse {
+    if (this.sessions === undefined) return failure(404, 'not found');
+    if (request.method !== 'POST') return failure(405, 'method not allowed', { allow: 'POST' });
+    const apiKey = parseLoginBody(request.body);
+    if (apiKey === undefined) return failure(400, 'body must be JSON with an apiKey string of 1 to 512 characters');
+    const session = this.sessions.authenticateApiKey(apiKey);
+    if (session === null) {
+      return failure(401, 'invalid API key', { 'www-authenticate': 'Bearer realm="nexuspulse"' });
+    }
+    return json(201, { sessionId: session.sessionId, expiresAt: session.expiresAt }, { 'cache-control': 'no-store' });
+  }
+
   private authorize(request: KvRequest): { readonly response: KvResponse } | { readonly client: string | undefined } {
     if (this.auth === undefined) return { client: undefined };
     const required = request.method === 'GET' ? 'reader' : 'writer';
@@ -200,6 +240,7 @@ export class KvApi {
   }
 
   private async route(request: KvRequest): Promise<KvResponse> {
+    if ((request.url.split('?')[0] ?? '') === SESSION_LOGIN_PATH) return this.login(request);
     const auth = this.authorize(request);
     if ('response' in auth) return auth.response;
     if (auth.client !== undefined) {
