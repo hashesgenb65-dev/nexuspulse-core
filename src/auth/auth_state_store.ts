@@ -11,6 +11,7 @@
  * silently dropped would let a damaged file change who can log in.
  */
 
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ApiKeyRecord, AuthSession, ScopePermission } from './manager.js';
@@ -95,8 +96,19 @@ function isSession(value: unknown): value is AuthSession {
   );
 }
 
+/** Hash of a file's exact bytes, or null when there is no file. */
+function fingerprint(bytes: Buffer | null): string | null {
+  return bytes === null ? null : createHash('sha256').update(bytes).digest('hex');
+}
+
 export class FileAuthStateStore implements AuthStateStore {
   private readonly file: string;
+  /**
+   * Fingerprint of the file as this store last read or wrote it. Undefined before the first read or write.
+   * A save refuses to replace a file whose fingerprint differs, so a running member cannot silently undo
+   * a change made to the file by someone else.
+   */
+  private known: string | null | undefined;
 
   constructor(file: string) {
     if (file.length === 0) throw new AuthStateError('the state file path must not be empty');
@@ -113,7 +125,10 @@ export class FileAuthStateStore implements AuthStateStore {
     try {
       stat = fs.statSync(this.file);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { apiKeys: [], sessions: [] };
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.known = null;
+        return { apiKeys: [], sessions: [] };
+      }
       throw error;
     }
     if (!stat.isFile()) throw new AuthStateError(`${this.file} is not a regular file`);
@@ -122,12 +137,14 @@ export class FileAuthStateStore implements AuthStateStore {
       throw new AuthStateError(`${this.file} has mode ${mode}; group and others must have no access (chmod 600)`);
     }
 
+    const bytes = fs.readFileSync(this.file);
     let parsed: unknown;
     try {
-      parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      parsed = JSON.parse(bytes.toString('utf8'));
     } catch {
       throw new AuthStateError(`${this.file} is not valid JSON`);
     }
+    this.known = fingerprint(bytes);
     if (!isRecord(parsed) || parsed.version !== AUTH_STATE_VERSION) {
       throw new AuthStateError(`${this.file} is not a version ${AUTH_STATE_VERSION} state file`);
     }
@@ -146,9 +163,16 @@ export class FileAuthStateStore implements AuthStateStore {
   /**
    * Replaces the saved state. The previous file stays in place until the new one is fully written.
    *
+   * @throws {AuthStateError} If the file changed since this store last read or wrote it. Load the state
+   *   again before saving.
    * @throws {Error} If any write, flush or rename fails. The temporary file is removed first.
    */
   save(state: PersistedAuthState): void {
+    if (this.known !== undefined && this.currentFingerprint() !== this.known) {
+      throw new AuthStateError(
+        `${this.file} changed since it was last read; it was not overwritten. Reload the state before saving.`,
+      );
+    }
     const tmp = `${this.file}.${process.pid}.tmp`;
     const body = `${JSON.stringify({ version: AUTH_STATE_VERSION, ...state }, null, 2)}\n`;
 
@@ -168,6 +192,17 @@ export class FileAuthStateStore implements AuthStateStore {
       throw error;
     }
     syncDirectory(path.dirname(this.file));
+    this.known = fingerprint(Buffer.from(body, 'utf8'));
+  }
+
+  /** Fingerprint of the file as it is on disk now. */
+  private currentFingerprint(): string | null {
+    try {
+      return fingerprint(fs.readFileSync(this.file));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
   }
 }
 

@@ -24,6 +24,7 @@ import { roleSatisfies, type Authenticator } from '../api/auth.js';
 import { SESSION_LOGIN_PATH } from '../api/session_auth.js';
 import type { AuthManager } from '../auth/manager.js';
 import { LoginFailureLimiter } from '../auth/login_limiter.js';
+import { AuthStateError } from '../auth/auth_state_store.js';
 
 /** Reads `{ "apiKey": "..." }`. Returns undefined for any other shape, or a key that is empty or too long. */
 function parseLoginBody(body: string | undefined): string | undefined {
@@ -225,7 +226,14 @@ export class KvApi {
       const retryAfterSec = Math.max(1, Math.ceil(gate.retryAfterMs / 1000));
       return failure(429, 'too many failed logins', { 'retry-after': String(retryAfterSec) });
     }
-    const session = this.sessions.authenticateApiKey(apiKey);
+    let session: ReturnType<AuthManager['authenticateApiKey']>;
+    try {
+      session = this.sessions.authenticateApiKey(apiKey);
+    } catch (error) {
+      // The state file changed underneath this member, so the new session cannot be saved. Refuse rather than overwrite it.
+      if (error instanceof AuthStateError) return failure(503, 'sessions cannot be saved until the state is reloaded');
+      throw error;
+    }
     if (session === null) {
       this.loginLimiter.recordFailure(keyId);
       this.recordLogin(keyId, 'LOGIN_FAILED');
