@@ -221,15 +221,18 @@ export class KvApi {
     const keyId = apiKey.split('.')[0] ?? apiKey;
     const gate = this.loginLimiter.check(keyId);
     if (!gate.allowed) {
+      this.recordLogin(keyId, 'LOGIN_BLOCKED');
       const retryAfterSec = Math.max(1, Math.ceil(gate.retryAfterMs / 1000));
       return failure(429, 'too many failed logins', { 'retry-after': String(retryAfterSec) });
     }
     const session = this.sessions.authenticateApiKey(apiKey);
     if (session === null) {
       this.loginLimiter.recordFailure(keyId);
+      this.recordLogin(keyId, 'LOGIN_FAILED');
       return failure(401, 'invalid API key', { 'www-authenticate': 'Bearer realm="nexuspulse"' });
     }
     this.loginLimiter.clear(keyId);
+    this.recordLogin(keyId, 'LOGIN_OK');
     return json(201, { sessionId: session.sessionId, expiresAt: session.expiresAt }, { 'cache-control': 'no-store' });
   }
 
@@ -300,6 +303,14 @@ export class KvApi {
       default:
         return failure(405, 'method not allowed', { allow: 'GET, PUT, DELETE' });
     }
+  }
+
+  /**
+   * Records a login attempt. The actor is the key id, which is not secret. The API key and the session
+   * id are never recorded.
+   */
+  private recordLogin(keyId: string, action: 'LOGIN_OK' | 'LOGIN_FAILED' | 'LOGIN_BLOCKED'): void {
+    this.audit?.append(keyId, action, 'auth:session', {});
   }
 
   /** Appends a committed write to the audit ledger. Only a 200 response counts as committed. */
