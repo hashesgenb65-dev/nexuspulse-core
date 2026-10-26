@@ -35,6 +35,22 @@
  */
 export const MAX_APPEND_ENTRY_BYTES = 512 * 1024;
 
+/**
+ * Largest JSON size of one log entry's command and payload. Leaves room under the 1 MiB peer frame limit
+ * for the request around it, so every entry can be delivered on its own.
+ */
+export const MAX_ENTRY_BYTES = 768 * 1024;
+
+/** Raised when a command is too large to be stored in the log. Code: ENTRY_TOO_LARGE. */
+export class EntryTooLargeError extends RangeError {
+  public readonly code = 'ENTRY_TOO_LARGE';
+
+  constructor(bytes: number) {
+    super(`entry of ${bytes} bytes is over the limit of ${MAX_ENTRY_BYTES}`);
+    this.name = 'EntryTooLargeError';
+  }
+}
+
 export type NodeState = 'FOLLOWER' | 'CANDIDATE' | 'LEADER';
 
 export interface LogEntry {
@@ -396,10 +412,16 @@ export class RaftConsensusNode {
     return this.commitIndex;
   }
 
+  /**
+   * @throws {Error} If this node is not the leader.
+   * @throws {EntryTooLargeError} If the command is over {@link MAX_ENTRY_BYTES}. Nothing is appended.
+   */
   public proposeCommand(command: string, payload: unknown): LogEntry {
     if (this.state !== 'LEADER') {
       throw new Error(`Node ${this.nodeId} is not the cluster leader. Current leader: ${this.leaderId}`);
     }
+    const bytes = Buffer.byteLength(JSON.stringify({ command, payload }) ?? '', 'utf8');
+    if (bytes > MAX_ENTRY_BYTES) throw new EntryTooLargeError(bytes);
 
     const entry: LogEntry = { index: this.lastIndex + 1, term: this.currentTerm, command, payload };
     this.log.push(entry);
