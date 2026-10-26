@@ -6,7 +6,7 @@
  */
 
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
-import type { AuthStateStore } from './auth_state_store.js';
+import { AuthStateError, type AuthStateStore } from './auth_state_store.js';
 
 /**
  * Parameters for hashing API key secrets with scrypt. Each key gets its own random salt, and the
@@ -223,6 +223,28 @@ export class AuthManager {
     this.nextPurgeAt = nowMs + this.sessionTtlMs;
     if (removed > 0) this.persistBestEffort();
     return removed;
+  }
+
+  /**
+   * Replaces the keys and sessions in memory with what the store holds now. Used when the state file
+   * is changed underneath a running member, for example by restoring a backup. Nothing changes if the
+   * file cannot be read or fails its checks. Sessions that exist only in memory, because their last
+   * save failed, are dropped by a successful reload.
+   *
+   * @throws {AuthStateError} If there is no store, or the file fails its checks.
+   */
+  public reload(): void {
+    if (this.stateStore === undefined) throw new AuthStateError('no state store is configured to reload from');
+    const saved = this.stateStore.load();
+    const now = this.now();
+    const apiKeys = new Map<string, ApiKeyRecord>();
+    for (const key of saved.apiKeys) apiKeys.set(key.keyId, key);
+    const activeSessions = new Map<string, AuthSession>();
+    for (const session of saved.sessions) {
+      if (now < session.expiresAt) activeSessions.set(session.sessionId, session);
+    }
+    this.apiKeys = apiKeys;
+    this.activeSessions = activeSessions;
   }
 
   /**

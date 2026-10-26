@@ -220,21 +220,31 @@ async function startMember(config: MeshNodeConfig, options: StartMeshNodeOptions
 
   driver.start();
 
-  // SIGHUP re-reads the token file. A file that fails a check is reported, and the current tokens stay in place.
+  // SIGHUP re-reads the token file and the auth state file. A file that fails a check is reported, and the
+  // current tokens or keys and sessions stay in place. Each file is reloaded on its own, so one failing does not block the other.
   const onReload = (): void => {
-    if (tokens === undefined || tokenFile === undefined) return;
-    try {
-      reloadTokenFile(tokens, tokenFile);
-    } catch (error) {
-      options.onError?.(error, 'token reload');
+    if (tokens !== undefined && tokenFile !== undefined) {
+      try {
+        reloadTokenFile(tokens, tokenFile);
+      } catch (error) {
+        options.onError?.(error, 'token reload');
+      }
+    }
+    if (sessions !== undefined) {
+      try {
+        sessions.reload();
+      } catch (error) {
+        options.onError?.(error, 'session reload');
+      }
     }
   };
-  if (tokens !== undefined) process.on('SIGHUP', onReload);
+  const reloadable = tokens !== undefined || sessions !== undefined;
+  if (reloadable) process.on('SIGHUP', onReload);
 
   let stopping: Promise<void> | undefined;
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
-      if (tokens !== undefined) process.off('SIGHUP', onReload);
+      if (reloadable) process.off('SIGHUP', onReload);
       host.dispose();
       driver.stop();
       transport.close();
