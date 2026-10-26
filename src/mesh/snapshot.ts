@@ -41,12 +41,24 @@ export interface StateHostOptions {
   readonly onSnapshotCommitted?: () => void;
   /** Receives background snapshot failures and warnings. They never stop the node. */
   readonly onError?: (error: unknown, where: string) => void;
+  /**
+   * How long a background snapshot may stay pending before a warning is reported. The log is kept whole
+   * until the snapshot is written, so the warning only means the log is growing. Defaults to
+   * SNAPSHOT_PENDING_WARN_MS. Integer from 1 to 3,600,000.
+   */
+  readonly pendingWarnMs?: number;
 }
+
+/** Longest allowed pendingWarnMs: one hour. */
+export const MAX_PENDING_WARN_MS = 3_600_000;
 
 interface PendingCompaction {
   readonly index: number;
   readonly term: number;
   readonly startedAt: number;
+  /** True once the still-pending warning has been reported, so it is reported once per write. */
+  warned: boolean;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 export class StateHost {
@@ -57,16 +69,22 @@ export class StateHost {
   private readonly snapshotDirectory: string | undefined;
   private readonly onSnapshotCommitted: (() => void) | undefined;
   private readonly onError: ((error: unknown, where: string) => void) | undefined;
+  private readonly pendingWarnMs: number;
   private latest: SnapshotPayload | undefined;
   private pending: PendingCompaction | undefined;
   private disposed = false;
 
-  /** @throws {RangeError} If the compaction threshold is not a positive integer. */
+  /** @throws {RangeError} If the compaction threshold or the pending warning time is out of range. */
   constructor(options: StateHostOptions) {
     const threshold = options.compactThreshold ?? DEFAULT_COMPACT_THRESHOLD;
     if (!Number.isInteger(threshold) || threshold <= 0) {
       throw new RangeError(`compactThreshold must be a positive integer, got ${threshold}`);
     }
+    const warnMs = options.pendingWarnMs ?? SNAPSHOT_PENDING_WARN_MS;
+    if (!Number.isInteger(warnMs) || warnMs < 1 || warnMs > MAX_PENDING_WARN_MS) {
+      throw new RangeError(`pendingWarnMs must be an integer from 1 to ${MAX_PENDING_WARN_MS}, got ${warnMs}`);
+    }
+    this.pendingWarnMs = warnMs;
     this.node = options.node;
     this.store = options.store;
     this.applier = new CommitApplier(options.node, options.store);
@@ -97,12 +115,18 @@ export class StateHost {
     return this.pending !== undefined;
   }
 
+  /** Milliseconds the current background snapshot has been pending, or undefined when none is. */
+  get pendingAgeMs(): number | undefined {
+    return this.pending === undefined ? undefined : Date.now() - this.pending.startedAt;
+  }
+
   /**
    * Stops committing background snapshots. A write still in progress finishes, but its result is
    * dropped, so the log is not trimmed after the node has stopped.
    */
   dispose(): void {
     this.disposed = true;
+    if (this.pending !== undefined) clearTimeout(this.pending.timer);
   }
 
   /**
@@ -173,15 +197,33 @@ export class StateHost {
    */
   private startBackgroundCompaction(directory: string, index: number, term: number): void {
     const data = this.store.referenceImage();
-    const pending: PendingCompaction = { index, term, startedAt: Date.now() };
+    const pending: PendingCompaction = { index, term, startedAt: Date.now(), warned: false };
     this.pending = pending;
+    pending.timer = setTimeout(() => this.warnStillPending(pending), this.pendingWarnMs);
+    pending.timer.unref?.();
     writeSnapshotFileAsync(directory, { index, term, data }).then(
       () => this.commitCompaction(pending, data),
       (error: unknown) => {
-        if (this.pending === pending) this.pending = undefined;
+        this.settle(pending);
         this.report(error, 'snapshot');
       },
     );
+  }
+
+  /** Reports, once, that a write has been pending longer than pendingWarnMs. The log is kept whole meanwhile. */
+  private warnStillPending(pending: PendingCompaction): void {
+    if (this.pending !== pending || pending.warned) return;
+    pending.warned = true;
+    this.report(
+      new Error(`snapshot ${pending.index} still pending after ${this.pendingWarnMs} ms; the log is kept whole`),
+      'snapshot',
+    );
+  }
+
+  /** Clears the pending write, and its warning timer, once the write has finished or failed. */
+  private settle(pending: PendingCompaction): void {
+    clearTimeout(pending.timer);
+    if (this.pending === pending) this.pending = undefined;
   }
 
   /**
@@ -189,9 +231,11 @@ export class StateHost {
    * snapshot newer than this one was installed from the leader in the meantime.
    */
   private commitCompaction(pending: PendingCompaction, data: StoreImage): void {
-    if (this.pending === pending) this.pending = undefined;
+    this.settle(pending);
+    // The timer normally reports a slow write while it is still pending. This covers a timer that ran late
+    // because the event loop was busy, so the slow write is still reported.
     const elapsed = Date.now() - pending.startedAt;
-    if (elapsed > SNAPSHOT_PENDING_WARN_MS) {
+    if (!pending.warned && elapsed > this.pendingWarnMs) {
       this.report(new Error(`snapshot ${pending.index} took ${elapsed} ms to write`), 'snapshot');
     }
     if (this.disposed) return;
