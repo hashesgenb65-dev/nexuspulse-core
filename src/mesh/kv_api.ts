@@ -23,6 +23,7 @@ import * as http from 'node:http';
 import { roleSatisfies, type Authenticator } from '../api/auth.js';
 import { SESSION_LOGIN_PATH } from '../api/session_auth.js';
 import type { AuthManager } from '../auth/manager.js';
+import { LoginFailureLimiter } from '../auth/login_limiter.js';
 
 /** Reads `{ "apiKey": "..." }`. Returns undefined for any other shape, or a key that is empty or too long. */
 function parseLoginBody(body: string | undefined): string | undefined {
@@ -87,6 +88,11 @@ export interface KvApiOptions {
    * with an authenticator that accepts sessions, such as SessionAuthenticator.
    */
   readonly sessions?: AuthManager;
+  /**
+   * Limits wrong API keys per key id on POST /v1/sessions. Defaults to 5 failures per 15 minutes.
+   * Only used together with `sessions`.
+   */
+  readonly loginLimiter?: LoginFailureLimiter;
   /**
    * Audit ledger. Every committed write is appended with the token name that made it, the key, the
    * Raft index and term, and the size of the value. Values themselves are not recorded.
@@ -171,10 +177,12 @@ export class KvApi {
   private readonly rateLimiter: DistributedRateLimiterEngine | undefined;
   private readonly audit: AuditLedgerEngine | undefined;
   private readonly sessions: AuthManager | undefined;
+  private readonly loginLimiter: LoginFailureLimiter;
 
   constructor(options: KvApiOptions) {
     this.auth = options.auth;
     this.sessions = options.sessions;
+    this.loginLimiter = options.loginLimiter ?? new LoginFailureLimiter();
     this.rateLimiter = options.rateLimiter;
     this.audit = options.audit;
     this.node = options.node;
@@ -209,10 +217,19 @@ export class KvApi {
     if (request.method !== 'POST') return failure(405, 'method not allowed', { allow: 'POST' });
     const apiKey = parseLoginBody(request.body);
     if (apiKey === undefined) return failure(400, 'body must be JSON with an apiKey string of 1 to 512 characters');
+    // The key id is the part before the first dot. A blocked key id is refused before its secret is checked.
+    const keyId = apiKey.split('.')[0] ?? apiKey;
+    const gate = this.loginLimiter.check(keyId);
+    if (!gate.allowed) {
+      const retryAfterSec = Math.max(1, Math.ceil(gate.retryAfterMs / 1000));
+      return failure(429, 'too many failed logins', { 'retry-after': String(retryAfterSec) });
+    }
     const session = this.sessions.authenticateApiKey(apiKey);
     if (session === null) {
+      this.loginLimiter.recordFailure(keyId);
       return failure(401, 'invalid API key', { 'www-authenticate': 'Bearer realm="nexuspulse"' });
     }
+    this.loginLimiter.clear(keyId);
     return json(201, { sessionId: session.sessionId, expiresAt: session.expiresAt }, { 'cache-control': 'no-store' });
   }
 
